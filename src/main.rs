@@ -1,6 +1,16 @@
-use std::{path::PathBuf, process::Stdio};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Cursor,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
-use color_eyre::eyre::{self, WrapErr as _};
+use color_eyre::eyre::{self, OptionExt as _, WrapErr as _};
+use harmonia_store_content_address::ContentAddressMethodAlgorithm;
+use harmonia_store_path::{StoreDir, StorePath};
+use harmonia_store_remote::{DaemonStore, HandshakeDaemonStore as _};
+use harmonia_utils_hash::Algorithm::SHA256;
+use tokio::io::BufReader;
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -67,7 +77,54 @@ struct UnitGraph {
     pub roots: Vec<usize>,
 }
 
-fn main() -> eyre::Result<()> {
+fn order_units(
+    all_transitive_deps: &mut HashMap<usize, Vec<usize>>,
+    ordered_units: &mut Vec<usize>,
+    all_units: &[Unit],
+    idx: usize,
+) {
+    if all_transitive_deps.contains_key(&idx) {
+        return;
+    }
+
+    let mut transitive_deps = Vec::new();
+    let unit = &all_units[idx];
+    for dep in &unit.dependencies {
+        order_units(all_transitive_deps, ordered_units, all_units, dep.index);
+        transitive_deps.extend_from_slice(&all_transitive_deps[&dep.index]);
+    }
+
+    all_transitive_deps.insert(idx, transitive_deps);
+
+    ordered_units.push(idx);
+}
+
+/// HACK: TODO: really need a better way of getting this
+fn find_crate_root(src_path: &Path) -> Option<&Path> {
+    if src_path.ends_with("src/lib.rs") {
+        src_path.parent().and_then(Path::parent)
+    } else if src_path.ends_with("build.rs") {
+        src_path.parent()
+    } else {
+        None
+    }
+}
+
+fn containing_store_path(store_dir: &StoreDir, path: &Path) -> Option<StorePath> {
+    let component = path
+        .strip_prefix(store_dir.to_path())
+        .ok()?
+        .components()
+        .next()?;
+    let std::path::Component::Normal(part) = component else {
+        return None;
+    };
+
+    store_dir.parse(part.to_str()?).ok()
+}
+
+#[tokio::main]
+async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
     // Shelling out to `cargo` since the cargo crate does not provide what we need
 
@@ -92,8 +149,99 @@ fn main() -> eyre::Result<()> {
         serde_json::from_slice(&output.stdout)?
     };
 
-    println!("{:#?}", unit_graph);
+    if unit_graph.version != 1 {
+        eyre::bail!("Unsupported unit graph version {}", unit_graph.version);
+    }
 
-    // TODO: parse Cargo.toml and make registry to
+    // TODO: parse Cargo.toml and make registry to cache packages in store.
+    // Would be useful to map package IDs to store paths persistently
+    // TODO: improve sorting
+    let (ordered_units, transitive_deps) = {
+        let mut transitive_deps = HashMap::with_capacity(unit_graph.units.len());
+        let mut units = Vec::with_capacity(unit_graph.units.len());
+        for root in unit_graph.roots {
+            order_units(&mut transitive_deps, &mut units, &unit_graph.units, root);
+        }
+        (units, transitive_deps)
+    };
+
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(Into::into)
+        .or_else(std::env::home_dir)
+        .ok_or_eyre("Could not find home directory")?;
+
+    let rustc_path = if let Some(path) = std::env::var_os("RUSTC").map(Into::into) {
+        path
+    } else {
+        which::which("rustc").wrap_err("Could not find rustc")?
+    };
+
+    // Someone might want a different one for some reason, idk how to get it
+    let store_dir = StoreDir::default();
+    let mut store = harmonia_store_remote::DaemonClientBuilder::new()
+        .set_store_dir(&store_dir)
+        .build_daemon()
+        .await?
+        .handshake()
+        .await?;
+
+    let rustc_store_path =
+        containing_store_path(&store_dir, &rustc_path).ok_or_eyre("rustc was not in Nix store")?;
+
+    // TODO: find some way of caching this on disk for interactive builds
+    let mut src_paths = HashMap::<&Path, StorePath>::new();
+    let mut drv_paths = HashMap::<usize, StorePath>::new();
+    for unit_idx in ordered_units {
+        // TODO: wrap rustc so we can get additional args from
+        // build.rs outputs
+        let unit = &unit_graph.units[unit_idx];
+
+        let crate_root =
+            find_crate_root(&unit.target.src_path).ok_or_eyre("unit does not have source path")?;
+
+        let drv_name = crate_root
+            .file_name()
+            .ok_or_eyre("empty path")?
+            .to_str()
+            .ok_or_eyre("invalid src path name")?;
+
+        if !src_paths.contains_key(crate_root) {
+            // TODO: Don't put the entire nar in memory
+            let mut encoder = nix_nar::Encoder::new(crate_root)?;
+            let mut buf = Vec::new();
+            std::io::copy(&mut encoder, &mut buf)?;
+            let reader = BufReader::new(Cursor::new(buf));
+            let path = store
+                .add_ca_to_store(
+                    &format!("{}-src", drv_name),
+                    ContentAddressMethodAlgorithm::NixArchive(SHA256),
+                    &Default::default(),
+                    false,
+                    reader,
+                )
+                .await?
+                .path;
+            src_paths.insert(crate_root, path);
+        }
+
+        let src_path = &src_paths[crate_root];
+
+        println!(
+            "{} -> {}",
+            crate_root.display(),
+            store_dir.display(src_path)
+        );
+
+        let mut rustc_args = Vec::new();
+        // nix derivation args start at argv[1], no `rustc` here
+        rustc_args.push("--crate-name".to_string());
+        rustc_args.push(unit.target.name.clone());
+
+        rustc_args.push(format!("--edition={}", unit.target.edition));
+    }
+
+    // TODO: run the build if we are outside a derivation,
+    // attach to output if we are inside a derivation.
+
     Ok(())
 }
