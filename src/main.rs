@@ -1,9 +1,36 @@
+use std::collections::HashSet;
+
 use anyhow::Context as _;
 use cargo::{
-    core::compiler::{UnitInterner, UserIntent, unit_graph},
+    core::{
+        SourceKind::Path,
+        compiler::{
+            Unit, UnitInterner, UserIntent,
+            unit_graph::{self, UnitGraph},
+        },
+    },
     ops::create_bcx,
     util::command_prelude::{ArgMatchesExt, Command, CommandExt as _, ProfileChecking},
 };
+
+// It seems like cargo doesn't have an existing function for this?
+fn order_units<'a>(
+    known_units: &mut HashSet<&Unit>,
+    ordered_units: &mut Vec<&'a Unit>,
+    unit_graph: &'a UnitGraph,
+    root_unit: &Unit,
+) {
+    let deps = unit_graph
+        .get(root_unit)
+        .map(|x| x.as_slice())
+        .unwrap_or_default();
+
+    for dep in deps {
+        if !known_units.contains(&dep.unit) {
+            ordered_units.push(&dep.unit);
+        }
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     // rustc things.
@@ -67,7 +94,20 @@ fn main() -> anyhow::Result<()> {
 
     let bcx = create_bcx(&ws, &compile_opts, &interner, None).context("resolving workspace")?;
 
-    unit_graph::emit_serialized_unit_graph(&bcx.roots, &bcx.unit_graph, ws.gctx())?;
+    // TODO: improve sorting
+    let units = {
+        let mut known_units = HashSet::with_capacity(bcx.unit_graph.len());
+        let mut units = Vec::with_capacity(bcx.unit_graph.len());
+        for root in &bcx.roots {
+            order_units(&mut known_units, &mut units, &bcx.unit_graph, root);
+        }
+        units
+    };
+
+    // TODO: persist caches.
+    // May be a good idea to make units for Cargo.lock and persist their outputs
+    // in a registry cache
+    for unit in units {}
 
     Ok(())
 }
