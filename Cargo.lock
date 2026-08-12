@@ -426,6 +426,7 @@ dependencies = [
 name = "cargo-dyndrv"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "cargo",
  "harmonia-protocol",
  "harmonia-store-aterm",

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.104"
 cargo = "0.98.0"
 harmonia-protocol = { git = "https://github.com/nix-community/harmonia.git", branch = "main" }
 harmonia-store-aterm = { git = "https://github.com/nix-community/harmonia.git", branch = "main" }
