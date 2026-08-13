@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsStr,
     io::Cursor,
     path::{Path, PathBuf},
     process::Stdio,
@@ -101,12 +102,13 @@ fn order_units(
 
 /// HACK: TODO: really need a better way of getting this
 fn find_crate_root(src_path: &Path) -> Option<&Path> {
-    if src_path.ends_with("src/lib.rs") {
-        src_path.parent().and_then(Path::parent)
-    } else if src_path.ends_with("build.rs") {
-        src_path.parent()
+    // technically rustc only needs the immediate parent,
+    // but many crates want CARGO_MANIFEST_DIR
+    let parent = src_path.parent();
+    if parent.and_then(Path::file_name) == Some(OsStr::new("src")) {
+        parent.and_then(Path::parent)
     } else {
-        None
+        parent
     }
 }
 
@@ -120,7 +122,7 @@ fn containing_store_path(store_dir: &StoreDir, path: &Path) -> Option<StorePath>
         return None;
     };
 
-    store_dir.parse(part.to_str()?).ok()
+    StorePath::from_base_path(part.to_str()?).ok()
 }
 
 #[tokio::main]

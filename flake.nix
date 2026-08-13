@@ -33,6 +33,7 @@
               "rustfmt"
             ])
             pkgs.rust-analyzer-nightly
+            pkgs.gdb
           ];
         };
       });
