@@ -1,7 +1,5 @@
-#![allow(unused)]
-
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ffi::OsStr,
     fmt::Display,
     io::Cursor,
@@ -23,7 +21,7 @@ use harmonia_store_remote::{DaemonStore, HandshakeDaemonStore as _};
 use harmonia_utils_hash::Algorithm::SHA256;
 use tokio::io::BufReader;
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(PartialEq, Eq, Copy, Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum CompileMode {
     Test,
@@ -36,6 +34,7 @@ enum CompileMode {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[allow(unused)]
 struct Target {
     pub kind: Vec<String>,
     pub crate_types: Vec<String>,
@@ -48,6 +47,7 @@ struct Target {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[allow(unused)]
 struct Profile {
     pub name: String,
     pub opt_level: String,
@@ -71,6 +71,7 @@ struct Dependency {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[allow(unused)]
 struct Unit {
     pub pkg_id: String,
     pub target: Target,
@@ -86,6 +87,12 @@ struct UnitGraph {
     pub version: u32,
     pub units: Vec<Unit>,
     pub roots: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct UnitCache {
+    pub drv_path: StorePath,
+    pub base_name: Option<String>,
 }
 
 fn order_units(
@@ -196,16 +203,11 @@ async fn main() -> eyre::Result<()> {
     let (ordered_units, transitive_deps) = {
         let mut transitive_deps = HashMap::with_capacity(unit_graph.units.len());
         let mut units = Vec::with_capacity(unit_graph.units.len());
-        for root in unit_graph.roots {
-            order_units(&mut transitive_deps, &mut units, &unit_graph.units, root);
+        for root in &unit_graph.roots {
+            order_units(&mut transitive_deps, &mut units, &unit_graph.units, *root);
         }
         (units, transitive_deps)
     };
-
-    let cargo_home = std::env::var_os("CARGO_HOME")
-        .map(Into::into)
-        .or_else(std::env::home_dir)
-        .ok_or_eyre("Could not find home directory")?;
 
     // Someone might want a different one for some reason, idk how to get it
     let store_dir = StoreDir::default();
@@ -232,7 +234,7 @@ async fn main() -> eyre::Result<()> {
 
     // TODO: find some way of caching this on disk for interactive builds
     let mut src_paths = HashMap::<&Path, StorePath>::new();
-    let mut drv_paths = HashMap::<usize, StorePath>::new();
+    let mut drv_cache: Vec<Option<UnitCache>> = vec![None; unit_graph.units.len()];
 
     let output_out = OutputName::from_str("out").unwrap();
 
@@ -240,6 +242,15 @@ async fn main() -> eyre::Result<()> {
         // TODO: wrap rustc so we can get additional args from
         // build.rs outputs
         let unit = &unit_graph.units[unit_idx];
+
+        if unit.target.crate_types.len() != 1 {
+            eyre::bail!(
+                "unit {} has unexpected crate types, {:?}",
+                unit.pkg_id,
+                unit.target.crate_types
+            );
+        }
+        let crate_type = &unit.target.crate_types[0];
 
         let crate_root =
             find_crate_root(&unit.target.src_path).ok_or_eyre("unit does not have source path")?;
@@ -271,12 +282,6 @@ async fn main() -> eyre::Result<()> {
 
         let src_path = &src_paths[crate_root];
 
-        println!(
-            "{} -> {}",
-            crate_root.display(),
-            store_dir.display(src_path)
-        );
-
         let mut args = Vec::new();
         // nix derivation args start at argv[1], no `rustc` here
         {
@@ -299,7 +304,17 @@ async fn main() -> eyre::Result<()> {
 
         add_long(&mut args, "crate-name", &unit.target.name);
         add_long(&mut args, "edition", &unit.target.edition);
-        add_long(&mut args, "crate-type", &unit.target.crate_types.join(","));
+        add_long(&mut args, "crate-type", crate_type);
+
+        if unit.mode == CompileMode::Check {
+            add_long(&mut args, "emit", &"metadata");
+        } else if unit.mode == CompileMode::Build {
+            if crate_type == "lib" || crate_type == "rlib" {
+                add_long(&mut args, "emit", &"metadata,link");
+            } else {
+                add_long(&mut args, "emit", &"link");
+            }
+        }
 
         add_codegen(&mut args, "debuginfo", &unit.profile.debuginfo);
 
@@ -307,13 +322,15 @@ async fn main() -> eyre::Result<()> {
         // TODO: check-cfg
         // TODO: for real this time, it's really necessary metadata and extra filename
         add_codegen(&mut args, "metadata", &format_args!("{:016x}", u64::MAX));
-        if unit.target.crate_types.contains(&String::from("lib")) {
-            add_codegen(
-                &mut args,
-                "extra-filename",
-                &format_args!("-{:016x}", u64::MAX),
-            );
-        }
+        let base_name = if unit.target.crate_types.contains(&String::from("lib")) {
+            let extra = format!("-{:016x}", u64::MAX);
+            add_codegen(&mut args, "extra-filename", &extra);
+            // cargo uses rustc outputs to learn rmeta locations.
+            // we don't have that luxury, but the default path is documented.
+            Some(format!("lib{}{}", unit.target.name, extra))
+        } else {
+            None
+        };
 
         let mut refs = StorePathSet::new();
         refs.insert(rustc_store_path.clone());
@@ -325,29 +342,44 @@ async fn main() -> eyre::Result<()> {
         inputs.insert(SingleDerivedPath::Opaque(src_path.clone()));
 
         for transitive_dep in &transitive_deps[&unit_idx] {
-            let drv_path = &drv_paths[transitive_dep];
-            refs.insert(drv_path.clone());
+            let dep_drv = &drv_cache[*transitive_dep].as_ref().unwrap().drv_path;
+            refs.insert(dep_drv.clone());
             inputs.insert(SingleDerivedPath::Built {
-                drv_path: Arc::new(SingleDerivedPath::Opaque(drv_path.clone())),
+                drv_path: Arc::new(SingleDerivedPath::Opaque(dep_drv.clone())),
                 output: output_out.clone(),
             });
 
-            let placeholder = Placeholder::ca_output(drv_path, &output_out).render();
+            let placeholder = Placeholder::ca_output(dep_drv, &output_out).render();
             args.push("-L".into());
             args.push(format!("dependency={}", placeholder.display()).into());
         }
 
         for direct_dep in &unit.dependencies {
-            let drv_path = &drv_paths[&direct_dep.index];
-            refs.insert(drv_path.clone());
+            let dep = drv_cache[direct_dep.index].as_ref().unwrap();
+            refs.insert(dep.drv_path.clone());
             inputs.insert(SingleDerivedPath::Built {
-                drv_path: Arc::new(SingleDerivedPath::Opaque(drv_path.clone())),
+                drv_path: Arc::new(SingleDerivedPath::Opaque(dep.drv_path.clone())),
                 output: output_out.clone(),
             });
 
-            let placeholder = Placeholder::ca_output(drv_path, &output_out).render();
-            args.push("--extern".into());
-            args.push(format!("{}={}", direct_dep.extern_crate_name, placeholder.display()).into());
+            if let Some(dep_base_name) = dep.base_name.as_ref() {
+                let placeholder = Placeholder::ca_output(&dep.drv_path, &output_out).render();
+                args.push("--extern".into());
+                args.push(
+                    format!(
+                        "{}={}/{}.{}",
+                        direct_dep.extern_crate_name,
+                        placeholder.display(),
+                        dep_base_name,
+                        if crate_type == "lib" || crate_type == "rlib" {
+                            "rmeta"
+                        } else {
+                            "rlib"
+                        },
+                    )
+                    .into(),
+                );
+            }
         }
 
         let drv = Derivation {
@@ -382,9 +414,17 @@ async fn main() -> eyre::Result<()> {
                 .await?
                 .path
         };
-        drv_paths.insert(unit_idx, drv_path.clone());
+        drv_cache[unit_idx] = Some(UnitCache {
+            drv_path,
+            base_name,
+        });
+    }
 
-        println!("{}", store_dir.display(&drv_path));
+    for unit_idx in unit_graph.roots {
+        println!(
+            "{}",
+            store_dir.display(&drv_cache[unit_idx].as_ref().unwrap().drv_path)
+        );
     }
 
     // TODO: run the build if we are outside a derivation,
