@@ -1,6 +1,9 @@
+#![allow(unused)]
+
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
+    fmt::Display,
     io::Cursor,
     path::{Path, PathBuf},
     process::Stdio,
@@ -112,17 +115,21 @@ fn find_crate_root(src_path: &Path) -> Option<&Path> {
     }
 }
 
-fn containing_store_path(store_dir: &StoreDir, path: &Path) -> Option<StorePath> {
-    let component = path
-        .strip_prefix(store_dir.to_path())
-        .ok()?
-        .components()
-        .next()?;
-    let std::path::Component::Normal(part) = component else {
+fn containing_store_path<'a>(
+    store_dir: &StoreDir,
+    path: &'a Path,
+) -> Option<(StorePath, &'a Path)> {
+    let mut components = path.strip_prefix(store_dir.to_path()).ok()?.components();
+
+    let std::path::Component::Normal(part) = components.next()? else {
         return None;
     };
+    let store_path = StorePath::from_base_path(part.to_str()?).ok()?;
+    Some((store_path, components.as_path()))
+}
 
-    StorePath::from_base_path(part.to_str()?).ok()
+fn add_long<T: Display>(rustc_args: &mut Vec<String>, option: &str, value: &T) {
+    rustc_args.push(format!("--{}={}", option, value));
 }
 
 #[tokio::main]
@@ -187,7 +194,7 @@ async fn main() -> eyre::Result<()> {
         .handshake()
         .await?;
 
-    let rustc_store_path =
+    let (rustc_store_path, _) =
         containing_store_path(&store_dir, &rustc_path).ok_or_eyre("rustc was not in Nix store")?;
 
     // TODO: find some way of caching this on disk for interactive builds
@@ -236,10 +243,31 @@ async fn main() -> eyre::Result<()> {
 
         let mut rustc_args = Vec::new();
         // nix derivation args start at argv[1], no `rustc` here
-        rustc_args.push("--crate-name".to_string());
-        rustc_args.push(unit.target.name.clone());
+        add_long(&mut rustc_args, "crate-name", &unit.target.name);
 
-        rustc_args.push(format!("--edition={}", unit.target.edition));
+        add_long(&mut rustc_args, "edition", &unit.target.edition);
+
+        {
+            let crate_relative = unit
+                .target
+                .src_path
+                .strip_prefix(crate_root)
+                .wrap_err("internal: crate main is not in crate root???")?;
+            let mut path = src_path.to_absolute_path(&store_dir);
+            path.push(crate_relative);
+            rustc_args.push(
+                path.into_os_string()
+                    .into_string()
+                    .ok()
+                    .ok_or_eyre("path not valid utf-8")?,
+            )
+        }
+
+        add_long(
+            &mut rustc_args,
+            "--crate-type",
+            &unit.target.crate_types.join(","),
+        );
     }
 
     // TODO: run the build if we are outside a derivation,
