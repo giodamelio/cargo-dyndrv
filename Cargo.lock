@@ -131,6 +131,7 @@ checksum = "bb1307f12aa967b5a58416e87b3653360e0fd614a016b6e970db08fecbb1b80d"
 name = "cargo-dyndrv"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "color-eyre",
  "harmonia-protocol",
  "harmonia-store-aterm",

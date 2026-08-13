@@ -1,17 +1,24 @@
 #![allow(unused)]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::OsStr,
     fmt::Display,
     io::Cursor,
     path::{Path, PathBuf},
     process::Stdio,
+    str::FromStr,
+    sync::Arc,
 };
 
 use color_eyre::eyre::{self, OptionExt as _, WrapErr as _};
 use harmonia_store_content_address::ContentAddressMethodAlgorithm;
-use harmonia_store_path::{StoreDir, StorePath};
+use harmonia_store_derivation::{
+    derivation::{Derivation, DerivationOutput},
+    derived_path::{OutputName, SingleDerivedPath},
+    placeholder::Placeholder,
+};
+use harmonia_store_path::{StoreDir, StorePath, StorePathName, StorePathSet};
 use harmonia_store_remote::{DaemonStore, HandshakeDaemonStore as _};
 use harmonia_utils_hash::Algorithm::SHA256;
 use tokio::io::BufReader;
@@ -115,21 +122,42 @@ fn find_crate_root(src_path: &Path) -> Option<&Path> {
     }
 }
 
-fn containing_store_path<'a>(
-    store_dir: &StoreDir,
-    path: &'a Path,
-) -> Option<(StorePath, &'a Path)> {
+fn containing_store_path(store_dir: &StoreDir, path: &Path) -> Option<StorePath> {
     let mut components = path.strip_prefix(store_dir.to_path()).ok()?.components();
 
     let std::path::Component::Normal(part) = components.next()? else {
         return None;
     };
     let store_path = StorePath::from_base_path(part.to_str()?).ok()?;
-    Some((store_path, components.as_path()))
+    Some(store_path)
 }
 
-fn add_long<T: Display>(rustc_args: &mut Vec<String>, option: &str, value: &T) {
-    rustc_args.push(format!("--{}={}", option, value));
+fn find_tool(store_dir: &StoreDir, tool_name: &str) -> eyre::Result<(PathBuf, StorePath)> {
+    let tool_path = if let Some(discovered) = std::env::var_os(tool_name.to_uppercase()) {
+        which::which(&discovered).wrap_err_with(|| {
+            format!(
+                "could not find tool {}, tried {}",
+                tool_name,
+                discovered.display()
+            )
+        })?
+    } else {
+        which::which(tool_name).wrap_err_with(|| format!("could not find tool {}", tool_name))?
+    };
+
+    let store_path = containing_store_path(store_dir, &tool_path)
+        .ok_or_else(|| eyre::eyre!("tool {} is not in the Nix store", tool_name))?;
+
+    Ok((tool_path, store_path))
+}
+
+fn add_long<T: Display>(args: &mut Vec<bytes::Bytes>, option: &str, value: &T) {
+    args.push(format!("--{}={}", option, value).into());
+}
+
+fn add_codegen<T: Display>(args: &mut Vec<bytes::Bytes>, option: &str, value: &T) {
+    args.push("-C".into());
+    args.push(format!("{}={}", option, value).into());
 }
 
 #[tokio::main]
@@ -179,12 +207,6 @@ async fn main() -> eyre::Result<()> {
         .or_else(std::env::home_dir)
         .ok_or_eyre("Could not find home directory")?;
 
-    let rustc_path = if let Some(path) = std::env::var_os("RUSTC").map(Into::into) {
-        path
-    } else {
-        which::which("rustc").wrap_err("Could not find rustc")?
-    };
-
     // Someone might want a different one for some reason, idk how to get it
     let store_dir = StoreDir::default();
     let mut store = harmonia_store_remote::DaemonClientBuilder::new()
@@ -194,12 +216,26 @@ async fn main() -> eyre::Result<()> {
         .handshake()
         .await?;
 
-    let (rustc_store_path, _) =
-        containing_store_path(&store_dir, &rustc_path).ok_or_eyre("rustc was not in Nix store")?;
+    let (rustc_path, rustc_store_path) = find_tool(&store_dir, "rustc")?;
+    let (cc_path, cc_store_path) = find_tool(&store_dir, "cc")?;
+
+    let mut base_env = BTreeMap::new();
+    base_env.insert(
+        "PATH".into(),
+        format!(
+            "{}:{}",
+            rustc_path.parent().unwrap().display(),
+            cc_path.parent().unwrap().display()
+        )
+        .into(),
+    );
 
     // TODO: find some way of caching this on disk for interactive builds
     let mut src_paths = HashMap::<&Path, StorePath>::new();
     let mut drv_paths = HashMap::<usize, StorePath>::new();
+
+    let output_out = OutputName::from_str("out").unwrap();
+
     for unit_idx in ordered_units {
         // TODO: wrap rustc so we can get additional args from
         // build.rs outputs
@@ -241,13 +277,10 @@ async fn main() -> eyre::Result<()> {
             store_dir.display(src_path)
         );
 
-        let mut rustc_args = Vec::new();
+        let mut args = Vec::new();
         // nix derivation args start at argv[1], no `rustc` here
-        add_long(&mut rustc_args, "crate-name", &unit.target.name);
-
-        add_long(&mut rustc_args, "edition", &unit.target.edition);
-
         {
+            // rustc handles finding other source files for us
             let crate_relative = unit
                 .target
                 .src_path
@@ -255,19 +288,103 @@ async fn main() -> eyre::Result<()> {
                 .wrap_err("internal: crate main is not in crate root???")?;
             let mut path = src_path.to_absolute_path(&store_dir);
             path.push(crate_relative);
-            rustc_args.push(
-                path.into_os_string()
-                    .into_string()
-                    .ok()
-                    .ok_or_eyre("path not valid utf-8")?,
-            )
+            args.push(path.into_os_string().into_encoded_bytes().into())
         }
 
         add_long(
-            &mut rustc_args,
-            "--crate-type",
-            &unit.target.crate_types.join(","),
+            &mut args,
+            "out-dir",
+            &Placeholder::standard_output(&output_out).render().display(),
         );
+
+        add_long(&mut args, "crate-name", &unit.target.name);
+        add_long(&mut args, "edition", &unit.target.edition);
+        add_long(&mut args, "crate-type", &unit.target.crate_types.join(","));
+
+        add_codegen(&mut args, "debuginfo", &unit.profile.debuginfo);
+
+        // TODO: embed-bitcode, lto
+        // TODO: check-cfg
+        // TODO: for real this time, it's really necessary metadata and extra filename
+        add_codegen(&mut args, "metadata", &format_args!("{:016x}", u64::MAX));
+        if unit.target.crate_types.contains(&String::from("lib")) {
+            add_codegen(
+                &mut args,
+                "extra-filename",
+                &format_args!("-{:016x}", u64::MAX),
+            );
+        }
+
+        let mut refs = StorePathSet::new();
+        refs.insert(rustc_store_path.clone());
+        refs.insert(cc_store_path.clone());
+
+        let mut inputs = BTreeSet::<SingleDerivedPath>::new();
+        inputs.insert(SingleDerivedPath::Opaque(rustc_store_path.clone()));
+        inputs.insert(SingleDerivedPath::Opaque(cc_store_path.clone()));
+        inputs.insert(SingleDerivedPath::Opaque(src_path.clone()));
+
+        for transitive_dep in &transitive_deps[&unit_idx] {
+            let drv_path = &drv_paths[transitive_dep];
+            refs.insert(drv_path.clone());
+            inputs.insert(SingleDerivedPath::Built {
+                drv_path: Arc::new(SingleDerivedPath::Opaque(drv_path.clone())),
+                output: output_out.clone(),
+            });
+
+            let placeholder = Placeholder::ca_output(drv_path, &output_out).render();
+            args.push("-L".into());
+            args.push(format!("dependency={}", placeholder.display()).into());
+        }
+
+        for direct_dep in &unit.dependencies {
+            let drv_path = &drv_paths[&direct_dep.index];
+            refs.insert(drv_path.clone());
+            inputs.insert(SingleDerivedPath::Built {
+                drv_path: Arc::new(SingleDerivedPath::Opaque(drv_path.clone())),
+                output: output_out.clone(),
+            });
+
+            let placeholder = Placeholder::ca_output(drv_path, &output_out).render();
+            args.push("--extern".into());
+            args.push(format!("{}={}", direct_dep.extern_crate_name, placeholder.display()).into());
+        }
+
+        let drv = Derivation {
+            name: StorePathName::from_str(drv_name).wrap_err("invalid derivation name")?,
+            outputs: BTreeMap::from([(
+                output_out.clone(),
+                DerivationOutput::CAFloating(ContentAddressMethodAlgorithm::NixArchive(SHA256)),
+            )]),
+            inputs,
+            platform: "x86_64-linux".into(),
+            builder: rustc_path
+                .clone()
+                .into_os_string()
+                .into_encoded_bytes()
+                .into(),
+            args,
+            env: base_env.clone(),
+            structured_attrs: None,
+        };
+
+        let drv_path = {
+            let bytes = harmonia_store_aterm::print_derivation_aterm(&store_dir, &drv.into_full());
+            let source = BufReader::new(Cursor::new(bytes.clone()));
+            store
+                .add_ca_to_store(
+                    &format!("{}.drv", drv_name),
+                    ContentAddressMethodAlgorithm::Text,
+                    &refs,
+                    false,
+                    source,
+                )
+                .await?
+                .path
+        };
+        drv_paths.insert(unit_idx, drv_path.clone());
+
+        println!("{}", store_dir.display(&drv_path));
     }
 
     // TODO: run the build if we are outside a derivation,
