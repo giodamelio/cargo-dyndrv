@@ -113,6 +113,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "build-wrap"
+version = "0.1.0"
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -323,6 +327,10 @@ dependencies = [
  "subtle",
  "zeroize",
 ]
+
+[[package]]
+name = "env-wrap"
+version = "0.1.0"
 
 [[package]]
 name = "equivalent"
