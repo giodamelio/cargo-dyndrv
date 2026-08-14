@@ -8,7 +8,11 @@
   };
 
   outputs =
-    { nixpkgs, fenix, ... }:
+    {
+      nixpkgs,
+      fenix,
+      self,
+    }:
     let
       inherit (nixpkgs) lib;
       makePkgs =
@@ -35,8 +39,28 @@
             pkgs.rust-analyzer-nightly
             pkgs.gdb
           ];
+
+          BUILD_WRAP = lib.getExe self.packages.${pkgs.stdenv.hostPlatform.system}.build-wrap;
+          ENV_WRAP = lib.getExe self.packages.${pkgs.stdenv.hostPlatform.system}.env-wrap;
         };
       });
+
+      packages = forAllSystems (pkgs: {
+        # these two only use stdlib, no need to use cargo
+        build-wrap = pkgs.buildRustCrate {
+          crateName = "build-wrap";
+          version = "0.1.0";
+          src = ./build-wrap;
+          crateBin = [ { name = "build-wrap"; } ];
+        };
+        env-wrap = pkgs.buildRustCrate {
+          crateName = "env-wrap";
+          version = "0.1.0";
+          src = ./env-wrap;
+          crateBin = [ { name = "env-wrap"; } ];
+        };
+      });
+
       formatter = forAllSystems (pkgs: pkgs.nixfmt-tree);
     };
 }
