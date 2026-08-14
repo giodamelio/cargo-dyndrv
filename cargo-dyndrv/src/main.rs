@@ -16,10 +16,12 @@ use harmonia_store_derivation::{
     derived_path::{OutputName, SingleDerivedPath},
     placeholder::Placeholder,
 };
-use harmonia_store_path::{StoreDir, StorePath, StorePathName, StorePathSet};
+use harmonia_store_path::{StoreDir, StorePath, StorePathName};
 use harmonia_store_remote::{DaemonStore, HandshakeDaemonStore as _};
 use harmonia_utils_hash::Algorithm::SHA256;
-use tokio::io::BufReader;
+use tokio::{io::BufReader, sync::Mutex};
+
+mod tools;
 
 #[derive(PartialEq, Eq, Copy, Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -129,35 +131,6 @@ fn find_crate_root(src_path: &Path) -> Option<&Path> {
     }
 }
 
-fn containing_store_path(store_dir: &StoreDir, path: &Path) -> Option<StorePath> {
-    let mut components = path.strip_prefix(store_dir.to_path()).ok()?.components();
-
-    let std::path::Component::Normal(part) = components.next()? else {
-        return None;
-    };
-    let store_path = StorePath::from_base_path(part.to_str()?).ok()?;
-    Some(store_path)
-}
-
-fn find_tool(store_dir: &StoreDir, tool_name: &str) -> eyre::Result<(PathBuf, StorePath)> {
-    let tool_path = if let Some(discovered) = std::env::var_os(tool_name.to_uppercase()) {
-        which::which(&discovered).wrap_err_with(|| {
-            format!(
-                "could not find tool {}, tried {}",
-                tool_name,
-                discovered.display()
-            )
-        })?
-    } else {
-        which::which(tool_name).wrap_err_with(|| format!("could not find tool {}", tool_name))?
-    };
-
-    let store_path = containing_store_path(store_dir, &tool_path)
-        .ok_or_else(|| eyre::eyre!("tool {} is not in the Nix store", tool_name))?;
-
-    Ok((tool_path, store_path))
-}
-
 fn add_long<T: Display>(args: &mut Vec<bytes::Bytes>, option: &str, value: &T) {
     args.push(format!("--{}={}", option, value).into());
 }
@@ -165,6 +138,47 @@ fn add_long<T: Display>(args: &mut Vec<bytes::Bytes>, option: &str, value: &T) {
 fn add_codegen<T: Display>(args: &mut Vec<bytes::Bytes>, option: &str, value: &T) {
     args.push("-C".into());
     args.push(format!("{}={}", option, value).into());
+}
+
+fn add_opaque_ref(
+    refs: &mut BTreeSet<StorePath>,
+    inputs: &mut BTreeSet<SingleDerivedPath>,
+    path: StorePath,
+) {
+    refs.insert(path.clone());
+    inputs.insert(SingleDerivedPath::Opaque(path));
+}
+
+async fn add_to_store_nar<T: DaemonStore>(
+    store: &mut T,
+    real_path: PathBuf,
+    name: &str,
+) -> eyre::Result<StorePath> {
+    static CACHE_MUTEX: Mutex<Option<HashMap<PathBuf, StorePath>>> = Mutex::const_new(None);
+    let mut guard = CACHE_MUTEX.lock().await;
+    let cache = guard.get_or_insert_default();
+
+    if let Some(store_path) = cache.get(&real_path) {
+        Ok(store_path.clone())
+    } else {
+        // TODO: Don't put the entire nar in memory
+        let mut encoder = nix_nar::Encoder::new(&real_path)?;
+        let mut buf = Vec::new();
+        std::io::copy(&mut encoder, &mut buf)?;
+        let reader = BufReader::new(Cursor::new(buf));
+        let store_path = store
+            .add_ca_to_store(
+                name,
+                ContentAddressMethodAlgorithm::NixArchive(SHA256),
+                &Default::default(),
+                false,
+                reader,
+            )
+            .await?
+            .path;
+        cache.insert(real_path, store_path.clone());
+        Ok(store_path)
+    }
 }
 
 #[tokio::main]
@@ -218,22 +232,11 @@ async fn main() -> eyre::Result<()> {
         .handshake()
         .await?;
 
-    let (rustc_path, rustc_store_path) = find_tool(&store_dir, "rustc")?;
-    let (cc_path, cc_store_path) = find_tool(&store_dir, "cc")?;
+    let tools = tools::Tools::find(&store_dir)?;
 
-    let mut base_env = BTreeMap::new();
-    base_env.insert(
-        "PATH".into(),
-        format!(
-            "{}:{}",
-            rustc_path.parent().unwrap().display(),
-            cc_path.parent().unwrap().display()
-        )
-        .into(),
-    );
+    let base_env = tools.base_environment();
 
     // TODO: find some way of caching this on disk for interactive builds
-    let mut src_paths = HashMap::<&Path, StorePath>::new();
     let mut drv_cache: Vec<Option<UnitCache>> = vec![None; unit_graph.units.len()];
 
     let output_out = OutputName::from_str("out").unwrap();
@@ -261,26 +264,12 @@ async fn main() -> eyre::Result<()> {
             .to_str()
             .ok_or_eyre("invalid src path name")?;
 
-        if !src_paths.contains_key(crate_root) {
-            // TODO: Don't put the entire nar in memory
-            let mut encoder = nix_nar::Encoder::new(crate_root)?;
-            let mut buf = Vec::new();
-            std::io::copy(&mut encoder, &mut buf)?;
-            let reader = BufReader::new(Cursor::new(buf));
-            let path = store
-                .add_ca_to_store(
-                    &format!("{}-src", drv_name),
-                    ContentAddressMethodAlgorithm::NixArchive(SHA256),
-                    &Default::default(),
-                    false,
-                    reader,
-                )
-                .await?
-                .path;
-            src_paths.insert(crate_root, path);
-        }
-
-        let src_path = &src_paths[crate_root];
+        let src_path = add_to_store_nar(
+            &mut store,
+            crate_root.to_owned(),
+            &format!("{}-src", drv_name),
+        )
+        .await?;
 
         let mut args = Vec::new();
         // nix derivation args start at argv[1], no `rustc` here
@@ -302,7 +291,7 @@ async fn main() -> eyre::Result<()> {
             &Placeholder::standard_output(&output_out).render().display(),
         );
 
-        add_long(&mut args, "crate-name", &unit.target.name);
+        add_long(&mut args, "crate-name", &unit.target.name.replace("-", "_"));
         add_long(&mut args, "edition", &unit.target.edition);
         add_long(&mut args, "crate-type", crate_type);
 
@@ -332,14 +321,11 @@ async fn main() -> eyre::Result<()> {
             None
         };
 
-        let mut refs = StorePathSet::new();
-        refs.insert(rustc_store_path.clone());
-        refs.insert(cc_store_path.clone());
-
-        let mut inputs = BTreeSet::<SingleDerivedPath>::new();
-        inputs.insert(SingleDerivedPath::Opaque(rustc_store_path.clone()));
-        inputs.insert(SingleDerivedPath::Opaque(cc_store_path.clone()));
-        inputs.insert(SingleDerivedPath::Opaque(src_path.clone()));
+        let mut refs = BTreeSet::new();
+        let mut inputs = BTreeSet::new();
+        add_opaque_ref(&mut refs, &mut inputs, tools.rustc.store_path.clone());
+        add_opaque_ref(&mut refs, &mut inputs, tools.cc.store_path.clone());
+        add_opaque_ref(&mut refs, &mut inputs, src_path.clone());
 
         for transitive_dep in &transitive_deps[&unit_idx] {
             let dep_drv = &drv_cache[*transitive_dep].as_ref().unwrap().drv_path;
@@ -390,7 +376,9 @@ async fn main() -> eyre::Result<()> {
             )]),
             inputs,
             platform: "x86_64-linux".into(),
-            builder: rustc_path
+            builder: tools
+                .rustc
+                .real_path
                 .clone()
                 .into_os_string()
                 .into_encoded_bytes()
