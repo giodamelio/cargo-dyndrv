@@ -23,6 +23,11 @@ use tokio::{io::BufReader, sync::Mutex};
 
 mod tools;
 
+const SCRIPT_FLAGS_OUTPUT: &str = "flags";
+const SCRIPT_IMMEDIATE_ARGS: &str = "args-immediate";
+const SCRIPT_TRANSITIVE_ARGS: &str = "args-transitive";
+const SCRIPT_IMMEDIATE_ENV: &str = "env";
+
 #[derive(PartialEq, Eq, Copy, Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum CompileMode {
@@ -91,10 +96,15 @@ struct UnitGraph {
     pub roots: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct UnitCacheMeta {
+    pub base_name: Option<String>,
+    pub custom_output: bool,
+}
 #[derive(Debug, Clone)]
 struct UnitCache {
     pub drv_path: StorePath,
-    pub base_name: Option<String>,
+    pub meta: UnitCacheMeta,
 }
 
 fn order_units(
@@ -138,15 +148,6 @@ fn add_long<T: Display>(args: &mut Vec<bytes::Bytes>, option: &str, value: &T) {
 fn add_codegen<T: Display>(args: &mut Vec<bytes::Bytes>, option: &str, value: &T) {
     args.push("-C".into());
     args.push(format!("{}={}", option, value).into());
-}
-
-fn add_opaque_ref(
-    refs: &mut BTreeSet<StorePath>,
-    inputs: &mut BTreeSet<SingleDerivedPath>,
-    path: StorePath,
-) {
-    refs.insert(path.clone());
-    inputs.insert(SingleDerivedPath::Opaque(path));
 }
 
 async fn add_to_store_nar<T: DaemonStore>(
@@ -239,21 +240,10 @@ async fn main() -> eyre::Result<()> {
     // TODO: find some way of caching this on disk for interactive builds
     let mut drv_cache: Vec<Option<UnitCache>> = vec![None; unit_graph.units.len()];
 
-    let output_out = OutputName::from_str("out").unwrap();
-
     for unit_idx in ordered_units {
         // TODO: wrap rustc so we can get additional args from
         // build.rs outputs
         let unit = &unit_graph.units[unit_idx];
-
-        if unit.target.crate_types.len() != 1 {
-            eyre::bail!(
-                "unit {} has unexpected crate types, {:?}",
-                unit.pkg_id,
-                unit.target.crate_types
-            );
-        }
-        let crate_type = &unit.target.crate_types[0];
 
         let crate_root =
             find_crate_root(&unit.target.src_path).ok_or_eyre("unit does not have source path")?;
@@ -271,126 +261,220 @@ async fn main() -> eyre::Result<()> {
         )
         .await?;
 
-        let mut args = Vec::new();
-        // nix derivation args start at argv[1], no `rustc` here
-        {
-            // rustc handles finding other source files for us
-            let crate_relative = unit
-                .target
-                .src_path
-                .strip_prefix(crate_root)
-                .wrap_err("internal: crate main is not in crate root???")?;
-            let mut path = src_path.to_absolute_path(&store_dir);
-            path.push(crate_relative);
-            args.push(path.into_os_string().into_encoded_bytes().into())
-        }
+        let mut env = base_env.clone();
 
-        add_long(
-            &mut args,
-            "out-dir",
-            &Placeholder::standard_output(&output_out).render().display(),
-        );
+        let mut inputs = BTreeSet::from([
+            SingleDerivedPath::Opaque(tools.rustc.store_path.clone()),
+            SingleDerivedPath::Opaque(tools.cc.store_path.clone()),
+            SingleDerivedPath::Opaque(src_path.clone()),
+        ]);
 
-        add_long(&mut args, "crate-name", &unit.target.name.replace("-", "_"));
-        add_long(&mut args, "edition", &unit.target.edition);
-        add_long(&mut args, "crate-type", crate_type);
-
-        if unit.mode == CompileMode::Check {
-            add_long(&mut args, "emit", &"metadata");
-        } else if unit.mode == CompileMode::Build {
-            if crate_type == "lib" || crate_type == "rlib" {
-                add_long(&mut args, "emit", &"metadata,link");
-            } else {
-                add_long(&mut args, "emit", &"link");
+        let (drv, meta) = if unit.mode == CompileMode::RunCustomBuild {
+            inputs.insert(SingleDerivedPath::Opaque(
+                tools.build_wrap.store_path.clone(),
+            ));
+            // should have a single dependency, which contains the actual executable
+            if unit.dependencies.len() != 1 {
+                eyre::bail!("build script has unexpected number of dependencies");
             }
-        }
-
-        add_codegen(&mut args, "debuginfo", &unit.profile.debuginfo);
-
-        // TODO: embed-bitcode, lto
-        // TODO: check-cfg
-        // TODO: for real this time, it's really necessary metadata and extra filename
-        add_codegen(&mut args, "metadata", &format_args!("{:016x}", u64::MAX));
-        let base_name = if unit.target.crate_types.contains(&String::from("lib")) {
-            let extra = format!("-{:016x}", u64::MAX);
-            add_codegen(&mut args, "extra-filename", &extra);
-            // cargo uses rustc outputs to learn rmeta locations.
-            // we don't have that luxury, but the default path is documented.
-            Some(format!("lib{}{}", unit.target.name, extra))
-        } else {
-            None
-        };
-
-        let mut refs = BTreeSet::new();
-        let mut inputs = BTreeSet::new();
-        add_opaque_ref(&mut refs, &mut inputs, tools.rustc.store_path.clone());
-        add_opaque_ref(&mut refs, &mut inputs, tools.cc.store_path.clone());
-        add_opaque_ref(&mut refs, &mut inputs, src_path.clone());
-
-        for transitive_dep in &transitive_deps[&unit_idx] {
-            let dep_drv = &drv_cache[*transitive_dep].as_ref().unwrap().drv_path;
-            refs.insert(dep_drv.clone());
-            inputs.insert(SingleDerivedPath::Built {
-                drv_path: Arc::new(SingleDerivedPath::Opaque(dep_drv.clone())),
-                output: output_out.clone(),
-            });
-
-            let placeholder = Placeholder::ca_output(dep_drv, &output_out).render();
-            args.push("-L".into());
-            args.push(format!("dependency={}", placeholder.display()).into());
-        }
-
-        for direct_dep in &unit.dependencies {
-            let dep = drv_cache[direct_dep.index].as_ref().unwrap();
-            refs.insert(dep.drv_path.clone());
+            let dep = drv_cache[unit.dependencies[0].index]
+                .as_ref()
+                .expect("units out of order");
             inputs.insert(SingleDerivedPath::Built {
                 drv_path: Arc::new(SingleDerivedPath::Opaque(dep.drv_path.clone())),
-                output: output_out.clone(),
+                output: OutputName::default(),
             });
+            let mut script = Placeholder::ca_output(&dep.drv_path, &OutputName::default()).render();
+            script.push(&unit.dependencies[0].extern_crate_name);
 
-            if let Some(dep_base_name) = dep.base_name.as_ref() {
-                let placeholder = Placeholder::ca_output(&dep.drv_path, &output_out).render();
-                args.push("--extern".into());
-                args.push(
-                    format!(
-                        "{}={}/{}.{}",
-                        direct_dep.extern_crate_name,
-                        placeholder.display(),
-                        dep_base_name,
-                        if crate_type == "lib" || crate_type == "rlib" {
-                            "rmeta"
-                        } else {
-                            "rlib"
-                        },
-                    )
+            let flags_dir =
+                Placeholder::standard_output(&OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap())
+                    .render();
+            let out_dir = Placeholder::standard_output(&OutputName::default()).render();
+
+            let args = vec![
+                src_path
+                    .to_absolute_path(&store_dir)
+                    .into_os_string()
+                    .into_encoded_bytes()
                     .into(),
+                flags_dir.into_os_string().into_encoded_bytes().into(),
+                out_dir.into_os_string().into_encoded_bytes().into(),
+                script.into_os_string().into_encoded_bytes().into(),
+            ];
+
+            (
+                Derivation {
+                    name: StorePathName::from_str(drv_name).wrap_err("invalid derivation name")?,
+                    outputs: BTreeMap::from([
+                        (
+                            OutputName::default(),
+                            DerivationOutput::CAFloating(
+                                ContentAddressMethodAlgorithm::NixArchive(SHA256),
+                            ),
+                        ),
+                        (
+                            OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap(),
+                            DerivationOutput::CAFloating(
+                                ContentAddressMethodAlgorithm::NixArchive(SHA256),
+                            ),
+                        ),
+                    ]),
+                    inputs,
+                    platform: "x86_64-linux".into(),
+                    builder: tools
+                        .build_wrap
+                        .real_path
+                        .clone()
+                        .into_os_string()
+                        .into_encoded_bytes()
+                        .into(),
+                    args,
+                    // TODO: cargo build script environment variables
+                    // (https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts)
+                    env,
+                    structured_attrs: None,
+                },
+                UnitCacheMeta {
+                    custom_output: true,
+                    ..Default::default()
+                },
+            )
+        } else {
+            if unit.target.crate_types.len() != 1 {
+                eyre::bail!(
+                    "unit {} has unexpected crate types, {:?}",
+                    unit.pkg_id,
+                    unit.target.crate_types
                 );
             }
-        }
+            let crate_type = &unit.target.crate_types[0];
 
-        let drv = Derivation {
-            name: StorePathName::from_str(drv_name).wrap_err("invalid derivation name")?,
-            outputs: BTreeMap::from([(
-                output_out.clone(),
-                DerivationOutput::CAFloating(ContentAddressMethodAlgorithm::NixArchive(SHA256)),
-            )]),
-            inputs,
-            platform: "x86_64-linux".into(),
-            builder: tools
-                .rustc
-                .real_path
-                .clone()
-                .into_os_string()
-                .into_encoded_bytes()
-                .into(),
-            args,
-            // TODO: cargo crate environment variables
-            // (https://doc.rust-lang.org/cargo/reference/environment-variables.html)
-            env: base_env.clone(),
-            structured_attrs: None,
+            let mut args = Vec::new();
+            // nix derivation args start at argv[1], no `rustc` here
+            {
+                // rustc handles finding other source files for us
+                let crate_relative = unit
+                    .target
+                    .src_path
+                    .strip_prefix(crate_root)
+                    .wrap_err("internal: crate main is not in crate root???")?;
+                let mut path = src_path.to_absolute_path(&store_dir);
+                path.push(crate_relative);
+                args.push(path.into_os_string().into_encoded_bytes().into())
+            }
+
+            add_long(
+                &mut args,
+                "out-dir",
+                &Placeholder::standard_output(&OutputName::default())
+                    .render()
+                    .display(),
+            );
+
+            add_long(&mut args, "crate-name", &unit.target.name.replace("-", "_"));
+            add_long(&mut args, "edition", &unit.target.edition);
+            add_long(&mut args, "crate-type", crate_type);
+
+            if unit.mode == CompileMode::Check {
+                add_long(&mut args, "emit", &"metadata");
+            } else if unit.mode == CompileMode::Build {
+                if crate_type == "lib" || crate_type == "rlib" {
+                    add_long(&mut args, "emit", &"metadata,link");
+                } else {
+                    add_long(&mut args, "emit", &"link");
+                }
+            }
+
+            add_codegen(&mut args, "debuginfo", &unit.profile.debuginfo);
+
+            // TODO: embed-bitcode, lto
+            // TODO: check-cfg
+            // TODO: for real this time, it's really necessary metadata and extra filename
+            add_codegen(&mut args, "metadata", &format_args!("{:016x}", u64::MAX));
+            let base_name = if unit.target.crate_types.contains(&String::from("lib")) {
+                let extra = format!("-{:016x}", u64::MAX);
+                add_codegen(&mut args, "extra-filename", &extra);
+                // cargo uses rustc outputs to learn rmeta locations.
+                // we don't have that luxury, but the default path is documented.
+                Some(format!("lib{}{}", unit.target.name, extra))
+            } else {
+                None
+            };
+
+            for transitive_dep in &transitive_deps[&unit_idx] {
+                let dep_drv = &drv_cache[*transitive_dep].as_ref().unwrap().drv_path;
+                inputs.insert(SingleDerivedPath::Built {
+                    drv_path: Arc::new(SingleDerivedPath::Opaque(dep_drv.clone())),
+                    output: OutputName::default(),
+                });
+
+                let placeholder = Placeholder::ca_output(dep_drv, &OutputName::default()).render();
+                args.push("-L".into());
+                args.push(format!("dependency={}", placeholder.display()).into());
+            }
+
+            for direct_dep in &unit.dependencies {
+                let dep = drv_cache[direct_dep.index].as_ref().unwrap();
+                inputs.insert(SingleDerivedPath::Built {
+                    drv_path: Arc::new(SingleDerivedPath::Opaque(dep.drv_path.clone())),
+                    output: OutputName::default(),
+                });
+
+                if let Some(dep_base_name) = dep.meta.base_name.as_ref() {
+                    let placeholder =
+                        Placeholder::ca_output(&dep.drv_path, &OutputName::default()).render();
+                    args.push("--extern".into());
+                    args.push(
+                        format!(
+                            "{}={}/{}.{}",
+                            direct_dep.extern_crate_name,
+                            placeholder.display(),
+                            dep_base_name,
+                            if crate_type == "lib" || crate_type == "rlib" {
+                                "rmeta"
+                            } else {
+                                "rlib"
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+
+            (
+                Derivation {
+                    name: StorePathName::from_str(drv_name).wrap_err("invalid derivation name")?,
+                    outputs: BTreeMap::from([(
+                        OutputName::default(),
+                        DerivationOutput::CAFloating(ContentAddressMethodAlgorithm::NixArchive(
+                            SHA256,
+                        )),
+                    )]),
+                    inputs,
+                    platform: "x86_64-linux".into(),
+                    builder: tools
+                        .rustc
+                        .real_path
+                        .clone()
+                        .into_os_string()
+                        .into_encoded_bytes()
+                        .into(),
+                    args,
+                    // TODO: cargo crate environment variables
+                    // (https://doc.rust-lang.org/cargo/reference/environment-variables.html)
+                    env,
+                    structured_attrs: None,
+                },
+                UnitCacheMeta {
+                    base_name,
+                    ..Default::default()
+                },
+            )
         };
 
         let drv_path = {
+            let refs = drv.inputs.iter().map(|p| p.root_path().clone()).collect();
             let bytes = harmonia_store_aterm::print_derivation_aterm(&store_dir, &drv.into_full());
             let source = BufReader::new(Cursor::new(bytes.clone()));
             store
@@ -404,10 +488,8 @@ async fn main() -> eyre::Result<()> {
                 .await?
                 .path
         };
-        drv_cache[unit_idx] = Some(UnitCache {
-            drv_path,
-            base_name,
-        });
+        eprintln!("{}", drv_path.to_absolute_path(&store_dir).display());
+        drv_cache[unit_idx] = Some(UnitCache { drv_path, meta });
     }
 
     for unit_idx in unit_graph.roots {
