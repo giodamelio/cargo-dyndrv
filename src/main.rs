@@ -396,6 +396,8 @@ async fn main() -> eyre::Result<()> {
                 .into_encoded_bytes()
                 .into(),
             args,
+            // TODO: cargo crate environment variables
+            // (https://doc.rust-lang.org/cargo/reference/environment-variables.html)
             env: base_env.clone(),
             structured_attrs: None,
         };
