@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     ffi::OsStr,
     fmt::Display,
     io::Cursor,
@@ -108,7 +108,7 @@ struct UnitCache {
 }
 
 fn order_units(
-    all_transitive_deps: &mut HashMap<usize, Vec<usize>>,
+    all_transitive_deps: &mut HashMap<usize, BTreeSet<usize>>,
     ordered_units: &mut Vec<usize>,
     all_units: &[Unit],
     idx: usize,
@@ -117,11 +117,12 @@ fn order_units(
         return;
     }
 
-    let mut transitive_deps = Vec::new();
+    let mut transitive_deps = BTreeSet::new();
     let unit = &all_units[idx];
     for dep in &unit.dependencies {
         order_units(all_transitive_deps, ordered_units, all_units, dep.index);
-        transitive_deps.extend_from_slice(&all_transitive_deps[&dep.index]);
+        transitive_deps.append(&mut all_transitive_deps[&dep.index].clone());
+        transitive_deps.insert(dep.index);
     }
 
     all_transitive_deps.insert(idx, transitive_deps);
@@ -141,13 +142,13 @@ fn find_crate_root(src_path: &Path) -> Option<&Path> {
     }
 }
 
-fn add_long<T: Display>(args: &mut Vec<bytes::Bytes>, option: &str, value: &T) {
-    args.push(format!("--{}={}", option, value).into());
+fn add_long<T: Display>(args: &mut VecDeque<bytes::Bytes>, option: &str, value: &T) {
+    args.push_back(format!("--{}={}", option, value).into());
 }
 
-fn add_codegen<T: Display>(args: &mut Vec<bytes::Bytes>, option: &str, value: &T) {
-    args.push("-C".into());
-    args.push(format!("{}={}", option, value).into());
+fn add_codegen<T: Display>(args: &mut VecDeque<bytes::Bytes>, option: &str, value: &T) {
+    args.push_back("-C".into());
+    args.push_back(format!("{}={}", option, value).into());
 }
 
 async fn add_to_store_nar<T: DaemonStore>(
@@ -350,8 +351,15 @@ async fn main() -> eyre::Result<()> {
             }
             let crate_type = &unit.target.crate_types[0];
 
-            let mut args = Vec::new();
-            // nix derivation args start at argv[1], no `rustc` here
+            // nix derivation args start at argv[1], but we put rustc in here anyway.
+            // It's easier to add the wrapper if needed
+            let mut args = VecDeque::from([tools
+                .rustc
+                .real_path
+                .clone()
+                .into_os_string()
+                .into_encoded_bytes()
+                .into()]);
             {
                 // rustc handles finding other source files for us
                 let crate_relative = unit
@@ -361,7 +369,7 @@ async fn main() -> eyre::Result<()> {
                     .wrap_err("internal: crate main is not in crate root???")?;
                 let mut path = src_path.to_absolute_path(&store_dir);
                 path.push(crate_relative);
-                args.push(path.into_os_string().into_encoded_bytes().into())
+                args.push_back(path.into_os_string().into_encoded_bytes().into())
             }
 
             add_long(
@@ -403,33 +411,48 @@ async fn main() -> eyre::Result<()> {
             };
 
             for transitive_dep in &transitive_deps[&unit_idx] {
-                let dep_drv = &drv_cache[*transitive_dep].as_ref().unwrap().drv_path;
-                inputs.insert(SingleDerivedPath::Built {
-                    drv_path: Arc::new(SingleDerivedPath::Opaque(dep_drv.clone())),
-                    output: OutputName::default(),
-                });
-
-                let placeholder = Placeholder::ca_output(dep_drv, &OutputName::default()).render();
-                args.push("-L".into());
-                args.push(format!("dependency={}", placeholder.display()).into());
-            }
-
-            for direct_dep in &unit.dependencies {
-                let dep = drv_cache[direct_dep.index].as_ref().unwrap();
+                let dep = drv_cache[*transitive_dep].as_ref().unwrap();
                 inputs.insert(SingleDerivedPath::Built {
                     drv_path: Arc::new(SingleDerivedPath::Opaque(dep.drv_path.clone())),
                     output: OutputName::default(),
                 });
 
+                let placeholder =
+                    Placeholder::ca_output(&dep.drv_path, &OutputName::default()).render();
+                args.push_back("-L".into());
+                args.push_back(format!("dependency={}", placeholder.display()).into());
+
+                if dep.meta.custom_output {
+                    inputs.insert(SingleDerivedPath::Built {
+                        drv_path: Arc::new(SingleDerivedPath::Opaque(dep.drv_path.clone())),
+                        output: OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap(),
+                    });
+
+                    let flags = Placeholder::ca_output(
+                        &dep.drv_path,
+                        &OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap(),
+                    )
+                    .render();
+
+                    args.push_back(
+                        format!("@{}", flags.join(SCRIPT_TRANSITIVE_ARGS).display()).into(),
+                    );
+                }
+            }
+
+            for direct_dep in &unit.dependencies {
+                // no need to add inputs here, they're already handled from transitive deps
+                let dep = drv_cache[direct_dep.index].as_ref().unwrap();
+
+                let out = Placeholder::ca_output(&dep.drv_path, &OutputName::default()).render();
+
                 if let Some(dep_base_name) = dep.meta.base_name.as_ref() {
-                    let placeholder =
-                        Placeholder::ca_output(&dep.drv_path, &OutputName::default()).render();
-                    args.push("--extern".into());
-                    args.push(
+                    args.push_back("--extern".into());
+                    args.push_back(
                         format!(
                             "{}={}/{}.{}",
                             direct_dep.extern_crate_name,
-                            placeholder.display(),
+                            out.display(),
                             dep_base_name,
                             if crate_type == "lib" || crate_type == "rlib" {
                                 "rmeta"
@@ -440,8 +463,44 @@ async fn main() -> eyre::Result<()> {
                         .into(),
                     );
                 }
+                if dep.meta.custom_output {
+                    inputs.insert(SingleDerivedPath::Opaque(tools.env_wrap.store_path.clone()));
+                    env.insert(
+                        "OUT_DIR".into(),
+                        out.into_os_string().into_encoded_bytes().into(),
+                    );
+                    let flags = Placeholder::ca_output(
+                        &dep.drv_path,
+                        &OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap(),
+                    )
+                    .render();
+
+                    // reversed since we're pushing from the front
+                    args.push_front("--".into());
+                    args.push_front(
+                        flags
+                            .join(SCRIPT_IMMEDIATE_ENV)
+                            .into_os_string()
+                            .into_encoded_bytes()
+                            .into(),
+                    );
+                    args.push_front(
+                        tools
+                            .env_wrap
+                            .real_path
+                            .as_os_str()
+                            .as_encoded_bytes()
+                            .to_owned()
+                            .into(),
+                    );
+
+                    args.push_back(
+                        format!("@{}", flags.join(SCRIPT_IMMEDIATE_ARGS).display()).into(),
+                    );
+                }
             }
 
+            let builder = args.pop_front().unwrap();
             (
                 Derivation {
                     name: StorePathName::from_str(drv_name).wrap_err("invalid derivation name")?,
@@ -453,14 +512,8 @@ async fn main() -> eyre::Result<()> {
                     )]),
                     inputs,
                     platform: "x86_64-linux".into(),
-                    builder: tools
-                        .rustc
-                        .real_path
-                        .clone()
-                        .into_os_string()
-                        .into_encoded_bytes()
-                        .into(),
-                    args,
+                    builder,
+                    args: args.into(),
                     // TODO: cargo crate environment variables
                     // (https://doc.rust-lang.org/cargo/reference/environment-variables.html)
                     env,
