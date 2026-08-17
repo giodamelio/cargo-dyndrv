@@ -16,7 +16,7 @@ use harmonia_store_derivation::{
     derived_path::{OutputName, SingleDerivedPath},
     placeholder::Placeholder,
 };
-use harmonia_store_path::{StoreDir, StorePath, StorePathName};
+use harmonia_store_path::{FromStoreDirStr, StoreDir, StorePath, StorePathName};
 use harmonia_store_remote::{DaemonStore, HandshakeDaemonStore as _};
 use harmonia_utils_hash::Algorithm::SHA256;
 use tokio::{io::BufReader, sync::Mutex};
@@ -107,6 +107,16 @@ struct UnitCache {
     pub meta: UnitCacheMeta,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct ExternConfig {
+    #[serde(default)]
+    pub extra_deps: Vec<String>,
+    #[serde(default)]
+    pub extra_env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub extra_path: Vec<String>,
+}
+
 fn order_units(
     all_transitive_deps: &mut HashMap<usize, BTreeSet<usize>>,
     ordered_units: &mut Vec<usize>,
@@ -151,6 +161,11 @@ fn add_codegen<T: Display>(args: &mut VecDeque<bytes::Bytes>, option: &str, valu
     args.push_back(format!("{}={}", option, value).into());
 }
 
+fn add_feature(args: &mut VecDeque<bytes::Bytes>, feature: &str) {
+    args.push_back("--cfg".into());
+    args.push_back(format!("feature=\"{}\"", feature).into());
+}
+
 async fn add_to_store_nar<T: DaemonStore>(
     store: &mut T,
     real_path: PathBuf,
@@ -186,6 +201,16 @@ async fn add_to_store_nar<T: DaemonStore>(
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
+
+    // TODO: accept this via some argument
+
+    let all_extern_config: BTreeMap<String, ExternConfig> =
+        if let Ok(content) = std::fs::read_to_string("extern.json") {
+            serde_json::from_str(&content).context("Could not parse extern configuration")?
+        } else {
+            Default::default()
+        };
+
     // Shelling out to `cargo` since the cargo crate does not provide what we need
 
     let unit_graph: UnitGraph = {
@@ -274,19 +299,33 @@ async fn main() -> eyre::Result<()> {
             inputs.insert(SingleDerivedPath::Opaque(
                 tools.build_wrap.store_path.clone(),
             ));
-            // should have a single dependency, which contains the actual executable
-            if unit.dependencies.len() != 1 {
-                eyre::bail!("build script has unexpected number of dependencies");
+
+            let mut executable_dep = None;
+            // cargo gives us a few dependencies.
+            // one has the actual built executable, the others are build script
+            // executions of dependencies that set metadata
+            for dep in &unit.dependencies {
+                let dep_unit = &unit_graph.units[dep.index];
+                if dep_unit.mode == CompileMode::Build {
+                    executable_dep = Some(dep);
+                } else if dep_unit.mode == CompileMode::RunCustomBuild {
+                    // TODO: whatever the hell i'm supposed to do here
+                }
             }
-            let dep = drv_cache[unit.dependencies[0].index]
+            let Some(executable_dep) = executable_dep else {
+                eyre::bail!("build script execution did not specify what to run");
+            };
+
+            let executable_cache = drv_cache[executable_dep.index]
                 .as_ref()
                 .expect("units out of order");
             inputs.insert(SingleDerivedPath::Built {
-                drv_path: Arc::new(SingleDerivedPath::Opaque(dep.drv_path.clone())),
+                drv_path: Arc::new(SingleDerivedPath::Opaque(executable_cache.drv_path.clone())),
                 output: OutputName::default(),
             });
-            let mut script = Placeholder::ca_output(&dep.drv_path, &OutputName::default()).render();
-            script.push(&unit.dependencies[0].extern_crate_name);
+            let mut script =
+                Placeholder::ca_output(&executable_cache.drv_path, &OutputName::default()).render();
+            script.push(&executable_dep.extern_crate_name);
 
             let flags_dir =
                 Placeholder::standard_output(&OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap())
@@ -303,6 +342,30 @@ async fn main() -> eyre::Result<()> {
                 out_dir.into_os_string().into_encoded_bytes().into(),
                 script.into_os_string().into_encoded_bytes().into(),
             ];
+
+            // TODO: calculate these
+            env.insert("TARGET".into(), "x86_64-unknown-linux-gnu".into());
+
+            if let Some(extern_config) = all_extern_config.get(&unit.pkg_id) {
+                eprintln!("Handling external config for {}", unit.pkg_id);
+                for extra_dep in &extern_config.extra_deps {
+                    let store_path = StorePath::from_store_dir_str(&store_dir, extra_dep)
+                        .wrap_err("Invalid store path in extra")?;
+                    inputs.insert(SingleDerivedPath::Opaque(store_path));
+                }
+
+                for (var, value) in &extern_config.extra_env {
+                    env.insert(var.clone().into(), value.clone().into());
+                }
+
+                let mut path: bytes::BytesMut =
+                    env.remove(&bytes::Bytes::from("PATH")).unwrap().into();
+                for item in &extern_config.extra_path {
+                    path.extend_from_slice(b":");
+                    path.extend_from_slice(item.as_bytes());
+                }
+                env.insert("PATH".into(), path.into());
+            }
 
             (
                 Derivation {
@@ -409,6 +472,10 @@ async fn main() -> eyre::Result<()> {
             } else {
                 None
             };
+
+            for feature in &unit.features {
+                add_feature(&mut args, feature);
+            }
 
             for transitive_dep in &transitive_deps[&unit_idx] {
                 let dep = drv_cache[*transitive_dep].as_ref().unwrap();
@@ -541,7 +608,6 @@ async fn main() -> eyre::Result<()> {
                 .await?
                 .path
         };
-        eprintln!("{}", drv_path.to_absolute_path(&store_dir).display());
         drv_cache[unit_idx] = Some(UnitCache { drv_path, meta });
     }
 
