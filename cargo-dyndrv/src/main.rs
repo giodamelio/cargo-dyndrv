@@ -290,7 +290,13 @@ async fn main() -> eyre::Result<()> {
 
         let mut env = base_env.clone();
         // TODO: more cargo env vars, perhaps via CARGO_METADATA
+        // TODO: calculate target info, most can be done with `rustc --print=cfg`
+        // Might require a wrapper, since cfg items set from build scripts will affect this
+        // host can come from `rustc --print=host-tuple`
+        env.insert("HOST".into(), "x86_64-unknown-linux-gnu".into());
         env.insert("TARGET".into(), "x86_64-unknown-linux-gnu".into());
+        env.insert("CARGO_CFG_TARGET_OS".into(), "linux".into());
+
         if let Some((_, version_str)) = unit.pkg_id.rsplit_once('@') {
             let version = semver::Version::parse(version_str).wrap_err("parsing version")?;
             env.insert("CARGO_PKG_VERSION".into(), version_str.to_owned().into());
@@ -311,6 +317,15 @@ async fn main() -> eyre::Result<()> {
                 version.pre.as_str().to_owned().into(),
             );
         }
+
+        env.insert(
+            "CARGO_MANIFEST_DIR".into(),
+            src_path
+                .to_absolute_path(&store_dir)
+                .into_os_string()
+                .into_encoded_bytes()
+                .into(),
+        );
 
         let mut inputs = BTreeSet::from([
             SingleDerivedPath::Opaque(tools.rustc.store_path.clone()),
@@ -386,6 +401,13 @@ async fn main() -> eyre::Result<()> {
                 }
                 env.insert("PATH".into(), path.into());
             }
+
+            for feature in &unit.features {
+                let feature_name = feature.to_uppercase().replace("-", "_");
+                env.insert(format!("CARGO_FEATURE_{}", feature_name).into(), "".into());
+            }
+
+            env.insert("OPT_LEVEL".into(), unit.profile.opt_level.clone().into());
 
             (
                 Derivation {
@@ -478,6 +500,8 @@ async fn main() -> eyre::Result<()> {
             }
 
             add_codegen(&mut args, "debuginfo", &unit.profile.debuginfo);
+
+            add_codegen(&mut args, "opt-level", &unit.profile.opt_level);
 
             // TODO: embed-bitcode, lto
             // TODO: check-cfg
