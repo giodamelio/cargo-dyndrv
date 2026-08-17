@@ -10,6 +10,7 @@ use std::{
     sync::Arc,
 };
 
+use cargo_metadata::MetadataCommand;
 use color_eyre::eyre::{self, OptionExt as _, WrapErr as _};
 use harmonia_store_content_address::ContentAddressMethodAlgorithm;
 use harmonia_store_derivation::{
@@ -141,18 +142,6 @@ fn order_units(
     ordered_units.push(idx);
 }
 
-/// HACK: TODO: really need a better way of getting this
-fn find_crate_root(src_path: &Path) -> Option<&Path> {
-    // technically rustc only needs the immediate parent,
-    // but many crates want CARGO_MANIFEST_DIR
-    let parent = src_path.parent();
-    if parent.and_then(Path::file_name) == Some(OsStr::new("src")) {
-        parent.and_then(Path::parent)
-    } else {
-        parent
-    }
-}
-
 fn add_long<T: Display>(args: &mut VecDeque<bytes::Bytes>, option: &str, value: &T) {
     args.push_back(format!("--{}={}", option, value).into());
 }
@@ -213,9 +202,9 @@ async fn main() -> eyre::Result<()> {
         };
 
     // Shelling out to `cargo` since the cargo crate does not provide what we need
+    let sys_args: Vec<_> = std::env::args().collect();
 
     let unit_graph: UnitGraph = {
-        let sys_args: Vec<_> = std::env::args_os().collect();
         let output = std::process::Command::new("cargo")
             .args(&sys_args[1..])
             .arg("-Z")
@@ -233,6 +222,31 @@ async fn main() -> eyre::Result<()> {
         }
 
         serde_json::from_slice(&output.stdout)?
+    };
+
+    // The unit graph doesn't give us everything we want,
+    // but the remainder can come from the packages in `cargo metadata`
+    // The package ids match the unit graph, so we can index on them
+    let package_metadata: HashMap<_, _> = {
+        let mut command = MetadataCommand::new();
+        let mut idx = 1;
+        loop {
+            if idx >= sys_args.len() - 1 {
+                break;
+            }
+            // TODO: flags
+            if &sys_args[idx] == "-m" || &sys_args[idx] == "--manifest-path" {
+                command.manifest_path(sys_args[idx + 1].clone());
+                idx += 1;
+            }
+            idx += 1;
+        }
+        let metadata = command.exec()?;
+        metadata
+            .packages
+            .into_iter()
+            .map(|package| (package.id.repr.clone(), package))
+            .collect()
     };
 
     if unit_graph.version != 1 {
@@ -271,19 +285,17 @@ async fn main() -> eyre::Result<()> {
         // TODO: wrap rustc so we can get additional args from
         // build.rs outputs
         let unit = &unit_graph.units[unit_idx];
+        let unit_meta = &package_metadata[&unit.pkg_id];
+        let crate_root = unit_meta
+            .manifest_path
+            .parent()
+            .ok_or_eyre("unit does not have a source path")?;
 
-        let crate_root =
-            find_crate_root(&unit.target.src_path).ok_or_eyre("unit does not have source path")?;
-
-        let drv_name = crate_root
-            .file_name()
-            .ok_or_eyre("empty path")?
-            .to_str()
-            .ok_or_eyre("invalid src path name")?;
+        let drv_name = crate_root.file_name().ok_or_eyre("empty path")?;
 
         let src_path = add_to_store_nar(
             &mut store,
-            crate_root.to_owned(),
+            crate_root.to_path_buf().into(),
             &format!("{}-src", drv_name),
         )
         .await?;
