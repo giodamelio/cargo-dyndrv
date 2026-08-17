@@ -145,6 +145,7 @@ dependencies = [
  "harmonia-store-remote",
  "harmonia-utils-hash",
  "nix-nar",
+ "semver",
  "serde",
  "serde_json",
  "tokio",

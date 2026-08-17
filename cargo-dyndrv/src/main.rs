@@ -288,6 +288,28 @@ async fn main() -> eyre::Result<()> {
         .await?;
 
         let mut env = base_env.clone();
+        // TODO: more cargo env vars, perhaps via CARGO_METADATA
+        env.insert("TARGET".into(), "x86_64-unknown-linux-gnu".into());
+        if let Some((_, version_str)) = unit.pkg_id.rsplit_once('@') {
+            let version = semver::Version::parse(version_str).wrap_err("parsing version")?;
+            env.insert("CARGO_PKG_VERSION".into(), version_str.to_owned().into());
+            env.insert(
+                "CARGO_PKG_VERSION_MAJOR".into(),
+                version.major.to_string().into(),
+            );
+            env.insert(
+                "CARGO_PKG_VERSION_MINOR".into(),
+                version.minor.to_string().into(),
+            );
+            env.insert(
+                "CARGO_PKG_VERSION_PATCH".into(),
+                version.patch.to_string().into(),
+            );
+            env.insert(
+                "CARGO_PKG_VERSION_PRE".into(),
+                version.pre.as_str().to_owned().into(),
+            );
+        }
 
         let mut inputs = BTreeSet::from([
             SingleDerivedPath::Opaque(tools.rustc.store_path.clone()),
@@ -342,9 +364,6 @@ async fn main() -> eyre::Result<()> {
                 out_dir.into_os_string().into_encoded_bytes().into(),
                 script.into_os_string().into_encoded_bytes().into(),
             ];
-
-            // TODO: calculate these
-            env.insert("TARGET".into(), "x86_64-unknown-linux-gnu".into());
 
             if let Some(extern_config) = all_extern_config.get(&unit.pkg_id) {
                 eprintln!("Handling external config for {}", unit.pkg_id);
