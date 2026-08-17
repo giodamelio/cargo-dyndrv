@@ -26,19 +26,18 @@
     {
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
-          packages = [
-            # Use unstable cargo to be safe.
-            # Technically we could use __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly instead
-            (pkgs.fenix.complete.withComponents [
-              "cargo"
-              "clippy"
-              "rust-src"
-              "rustc"
-              "rustfmt"
-            ])
-            pkgs.rust-analyzer-nightly
-            pkgs.gdb
+          packages = with pkgs; [
+            # Use nixpkgs rust, fenix rust uses an integrated ld that doesn't set proper rpaths
+            rustc
+            cargo
+
+            gdb
+            rust-analyzer
           ];
+
+          # Use unstable cargo to be safe.
+          # Technically we could use __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly instead
+          CARGO = lib.getExe' pkgs.fenix.complete.cargo "cargo";
 
           BUILD_WRAP = lib.getExe self.packages.${pkgs.stdenv.hostPlatform.system}.build-wrap;
           ENV_WRAP = lib.getExe self.packages.${pkgs.stdenv.hostPlatform.system}.env-wrap;
