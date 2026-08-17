@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     ffi::OsStr,
     fmt::Display,
+    hash::{Hash, Hasher},
     io::Cursor,
     path::{Path, PathBuf},
     process::Stdio,
@@ -28,7 +29,7 @@ const SCRIPT_IMMEDIATE_ARGS: &str = "args-immediate";
 const SCRIPT_TRANSITIVE_ARGS: &str = "args-transitive";
 const SCRIPT_IMMEDIATE_ENV: &str = "env";
 
-#[derive(PartialEq, Eq, Copy, Clone, Debug, serde::Deserialize)]
+#[derive(PartialEq, Eq, Copy, Clone, Debug, Hash, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum CompileMode {
     Test,
@@ -40,7 +41,7 @@ enum CompileMode {
     RunCustomBuild,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Hash, serde::Deserialize)]
 #[allow(unused)]
 struct Target {
     pub kind: Vec<String>,
@@ -53,7 +54,7 @@ struct Target {
     pub test: bool,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Hash, serde::Deserialize)]
 #[allow(unused)]
 struct Profile {
     pub name: String,
@@ -71,13 +72,13 @@ struct Profile {
     // TODO: Strip
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Hash, serde::Deserialize)]
 struct Dependency {
     pub index: usize,
     pub extern_crate_name: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Hash, serde::Deserialize)]
 #[allow(unused)]
 struct Unit {
     pub pkg_id: String,
@@ -480,10 +481,20 @@ async fn main() -> eyre::Result<()> {
 
             // TODO: embed-bitcode, lto
             // TODO: check-cfg
-            // TODO: for real this time, it's really necessary metadata and extra filename
-            add_codegen(&mut args, "metadata", &format_args!("{:016x}", u64::MAX));
+            // TODO: improve hash calculation
+            let dep_hash = {
+                let mut hasher = std::hash::DefaultHasher::new();
+                for direct_dep in &unit.dependencies {
+                    let dep = drv_cache[direct_dep.index].as_ref().unwrap();
+                    Hash::hash(&dep.drv_path, &mut hasher);
+                }
+                unit.hash(&mut hasher);
+
+                hasher.finish()
+            };
+            add_codegen(&mut args, "metadata", &format_args!("{:016x}", dep_hash));
             let base_name = if unit.target.crate_types.contains(&String::from("lib")) {
-                let extra = format!("-{:016x}", u64::MAX);
+                let extra = format!("-{:016x}", dep_hash);
                 add_codegen(&mut args, "extra-filename", &extra);
                 // cargo uses rustc outputs to learn rmeta locations.
                 // we don't have that luxury, but the default path is documented.
