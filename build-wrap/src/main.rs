@@ -11,12 +11,17 @@ fn push_arg(file: &mut File, flag: &str, value: &str) -> io::Result<()> {
     file.write_all(format!("{}\n{}\n", flag, value).as_bytes())
 }
 
+fn push_metadata(file: &mut File, links_key: &str, key: &str, value: &str) -> io::Result<()> {
+    file.write_all(format!("DEP_{}_{}={}\n", links_key, key.to_uppercase(), value).as_bytes())
+}
+
 fn main() -> ExitCode {
-    let mut args = std::env::args_os();
+    let mut args = std::env::args();
     args.next().expect("more than 0 arguments");
     // nix derivations can't set cwd, do it ourselves
     let cwd = args.next().expect("crate root argument");
 
+    let links_key = args.next().expect("links key argument").to_uppercase();
     let flags_dir: PathBuf = args.next().expect("flags directory argument").into();
     let out_dir: PathBuf = args.next().expect("out directory argument").into();
     let executable: PathBuf = args.next().expect("executable argument").into();
@@ -29,6 +34,13 @@ fn main() -> ExitCode {
     let mut transitive_file = File::create_new(flags_dir.join("args-transitive")).unwrap();
     // must be separate since --env-set is unstable
     let mut env_file = File::create_new(flags_dir.join("env")).unwrap();
+    // separate from env since it gets set in different packages
+
+    let mut metadata_file = if !links_key.is_empty() {
+        Some(File::create_new(flags_dir.join("metadata")).unwrap())
+    } else {
+        None
+    };
 
     let mut error_msg = None;
 
@@ -76,8 +88,24 @@ fn main() -> ExitCode {
                 error_msg = Some(value.to_string());
                 Ok(())
             }
-            // TODO: cargo-metadata
-            _ => Ok(()),
+            "metadata" => {
+                if let Some(metadata_file) = &mut metadata_file {
+                    if let Some((key, value)) = value.split_once('=') {
+                        push_metadata(metadata_file, &links_key, key, value)
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+            key => {
+                if let Some(metadata_file) = &mut metadata_file {
+                    push_metadata(metadata_file, &links_key, key, value)
+                } else {
+                    Ok(())
+                }
+            }
         }
         .expect("could not write arguments");
     }

@@ -1,10 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    ffi::OsStr,
     fmt::Display,
     hash::{Hash, Hasher},
     io::Cursor,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::Stdio,
     str::FromStr,
     sync::Arc,
@@ -29,6 +28,7 @@ const SCRIPT_FLAGS_OUTPUT: &str = "flags";
 const SCRIPT_IMMEDIATE_ARGS: &str = "args-immediate";
 const SCRIPT_TRANSITIVE_ARGS: &str = "args-transitive";
 const SCRIPT_IMMEDIATE_ENV: &str = "env";
+const SCRIPT_METADATA_ENV: &str = "metadata";
 
 #[derive(PartialEq, Eq, Copy, Clone, Debug, Hash, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -102,6 +102,7 @@ struct UnitGraph {
 struct UnitCacheMeta {
     pub base_name: Option<String>,
     pub custom_output: bool,
+    pub has_links: bool,
 }
 #[derive(Debug, Clone)]
 struct UnitCache {
@@ -186,6 +187,31 @@ async fn add_to_store_nar<T: DaemonStore>(
         cache.insert(real_path, store_path.clone());
         Ok(store_path)
     }
+}
+
+fn add_metadata_env(
+    env: &mut BTreeMap<bytes::Bytes, bytes::Bytes>,
+    meta: &cargo_metadata::Package,
+) {
+    env.insert("CARGO_PKG_VERSION".into(), meta.version.to_string().into());
+    env.insert(
+        "CARGO_PKG_VERSION_MAJOR".into(),
+        meta.version.major.to_string().into(),
+    );
+    env.insert(
+        "CARGO_PKG_VERSION_MINOR".into(),
+        meta.version.minor.to_string().into(),
+    );
+    env.insert(
+        "CARGO_PKG_VERSION_PATCH".into(),
+        meta.version.patch.to_string().into(),
+    );
+    env.insert(
+        "CARGO_PKG_VERSION_PRE".into(),
+        meta.version.pre.as_str().to_owned().into(),
+    );
+
+    // TODO: more of these
 }
 
 #[tokio::main]
@@ -301,34 +327,14 @@ async fn main() -> eyre::Result<()> {
         .await?;
 
         let mut env = base_env.clone();
-        // TODO: more cargo env vars, perhaps via CARGO_METADATA
+        // TODO: more cargo env vars not from cargo metadata
         // TODO: calculate target info, most can be done with `rustc --print=cfg`
         // Might require a wrapper, since cfg items set from build scripts will affect this
         // host can come from `rustc --print=host-tuple`
         env.insert("HOST".into(), "x86_64-unknown-linux-gnu".into());
         env.insert("TARGET".into(), "x86_64-unknown-linux-gnu".into());
         env.insert("CARGO_CFG_TARGET_OS".into(), "linux".into());
-
-        if let Some((_, version_str)) = unit.pkg_id.rsplit_once('@') {
-            let version = semver::Version::parse(version_str).wrap_err("parsing version")?;
-            env.insert("CARGO_PKG_VERSION".into(), version_str.to_owned().into());
-            env.insert(
-                "CARGO_PKG_VERSION_MAJOR".into(),
-                version.major.to_string().into(),
-            );
-            env.insert(
-                "CARGO_PKG_VERSION_MINOR".into(),
-                version.minor.to_string().into(),
-            );
-            env.insert(
-                "CARGO_PKG_VERSION_PATCH".into(),
-                version.patch.to_string().into(),
-            );
-            env.insert(
-                "CARGO_PKG_VERSION_PRE".into(),
-                version.pre.as_str().to_owned().into(),
-            );
-        }
+        add_metadata_env(&mut env, unit_meta);
 
         env.insert(
             "CARGO_MANIFEST_DIR".into(),
@@ -350,18 +356,65 @@ async fn main() -> eyre::Result<()> {
                 tools.build_wrap.store_path.clone(),
             ));
 
+            let mut args = VecDeque::from([
+                tools
+                    .build_wrap
+                    .real_path
+                    .clone()
+                    .into_os_string()
+                    .into_encoded_bytes()
+                    .into(),
+                src_path
+                    .to_absolute_path(&store_dir)
+                    .into_os_string()
+                    .into_encoded_bytes()
+                    .into(),
+                unit_meta.links.clone().unwrap_or_default().into(),
+            ]);
+
             let mut executable_dep = None;
             // cargo gives us a few dependencies.
             // one has the actual built executable, the others are build script
             // executions of dependencies that set metadata
+            let mut env_files = Vec::new();
             for dep in &unit.dependencies {
+                let dep_cache = drv_cache[dep.index].as_ref().expect("units out of order");
                 let dep_unit = &unit_graph.units[dep.index];
                 if dep_unit.mode == CompileMode::Build {
                     executable_dep = Some(dep);
-                } else if dep_unit.mode == CompileMode::RunCustomBuild {
-                    // TODO: whatever the hell i'm supposed to do here
+                } else if dep_cache.meta.has_links {
+                    inputs.insert(SingleDerivedPath::Built {
+                        drv_path: Arc::new(SingleDerivedPath::Opaque(dep_cache.drv_path.clone())),
+                        output: OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap(),
+                    });
+                    let flags = Placeholder::ca_output(
+                        &dep_cache.drv_path,
+                        &OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap(),
+                    );
+                    env_files.push(flags.render().join(SCRIPT_METADATA_ENV));
                 }
             }
+
+            if !env_files.is_empty() {
+                inputs.insert(SingleDerivedPath::Opaque(tools.env_wrap.store_path.clone()));
+
+                // reversed since we're pushing from the front
+
+                args.push_front("--".into());
+                for env_file in env_files.into_iter() {
+                    args.push_front(env_file.into_os_string().into_encoded_bytes().into());
+                }
+                args.push_front(
+                    tools
+                        .env_wrap
+                        .real_path
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .to_owned()
+                        .into(),
+                );
+            }
+
             let Some(executable_dep) = executable_dep else {
                 eyre::bail!("build script execution did not specify what to run");
             };
@@ -373,25 +426,35 @@ async fn main() -> eyre::Result<()> {
                 drv_path: Arc::new(SingleDerivedPath::Opaque(executable_cache.drv_path.clone())),
                 output: OutputName::default(),
             });
-            let mut script =
-                Placeholder::ca_output(&executable_cache.drv_path, &OutputName::default()).render();
-            script.push(&executable_dep.extern_crate_name);
-
-            let flags_dir =
+            // flags_dir
+            args.push_back(
                 Placeholder::standard_output(&OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap())
-                    .render();
-            let out_dir = Placeholder::standard_output(&OutputName::default()).render();
-
-            let args = vec![
-                src_path
-                    .to_absolute_path(&store_dir)
+                    .render()
                     .into_os_string()
                     .into_encoded_bytes()
                     .into(),
-                flags_dir.into_os_string().into_encoded_bytes().into(),
-                out_dir.into_os_string().into_encoded_bytes().into(),
-                script.into_os_string().into_encoded_bytes().into(),
-            ];
+            );
+            // out_dir
+            args.push_back(
+                Placeholder::standard_output(&OutputName::default())
+                    .render()
+                    .into_os_string()
+                    .into_encoded_bytes()
+                    .into(),
+            );
+            // script
+            args.push_back(
+                {
+                    let mut script =
+                        Placeholder::ca_output(&executable_cache.drv_path, &OutputName::default())
+                            .render();
+                    script.push(&executable_dep.extern_crate_name);
+                    script
+                }
+                .into_os_string()
+                .into_encoded_bytes()
+                .into(),
+            );
 
             if let Some(extern_config) = all_extern_config.get(&unit.pkg_id) {
                 eprintln!("Handling external config for {}", unit.pkg_id);
@@ -421,9 +484,11 @@ async fn main() -> eyre::Result<()> {
 
             env.insert("OPT_LEVEL".into(), unit.profile.opt_level.clone().into());
 
+            let builder = args.pop_front().unwrap();
             (
                 Derivation {
-                    name: StorePathName::from_str(drv_name).wrap_err("invalid derivation name")?,
+                    name: StorePathName::from_str(&format!("{}-run", drv_name))
+                        .wrap_err("invalid derivation name")?,
                     outputs: BTreeMap::from([
                         (
                             OutputName::default(),
@@ -440,14 +505,8 @@ async fn main() -> eyre::Result<()> {
                     ]),
                     inputs,
                     platform: "x86_64-linux".into(),
-                    builder: tools
-                        .build_wrap
-                        .real_path
-                        .clone()
-                        .into_os_string()
-                        .into_encoded_bytes()
-                        .into(),
-                    args,
+                    builder,
+                    args: args.into(),
                     // TODO: cargo build script environment variables
                     // (https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts)
                     env,
@@ -455,6 +514,7 @@ async fn main() -> eyre::Result<()> {
                 },
                 UnitCacheMeta {
                     custom_output: true,
+                    has_links: unit_meta.links.is_some(),
                     ..Default::default()
                 },
             )
