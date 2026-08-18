@@ -21,32 +21,34 @@
           inherit system;
           overlays = [ fenix.overlays.default ];
         };
-      forAllSystems = f: lib.genAttrs lib.systems.flakeExposed (system: f (makePkgs system));
+      forAllSystems = f: lib.genAttrs lib.systems.flakeExposed (system: f system (makePkgs system));
     in
     {
-      devShells = forAllSystems (pkgs: {
-        default = pkgs.mkShell {
-          packages = with pkgs; [
-            # Use nixpkgs rust, fenix rust uses an integrated ld that doesn't set proper rpaths
-            rustc
-            cargo
-            rustfmt
-            clippy
+      devShells = forAllSystems (
+        system: pkgs: {
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              # Use nixpkgs rust, fenix rust uses an integrated ld that doesn't set proper rpaths
+              rustc
+              cargo
+              rustfmt
+              clippy
 
-            gdb
-            rust-analyzer
-          ];
+              gdb
+              rust-analyzer
+            ];
 
-          # Use unstable cargo to be safe.
-          # Technically we could use __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly instead
-          CARGO = lib.getExe' pkgs.fenix.complete.cargo "cargo";
+            # Use unstable cargo to be safe.
+            # Technically we could use __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly instead
+            CARGO = lib.getExe' pkgs.fenix.complete.cargo "cargo";
 
-          BUILD_WRAP = lib.getExe self.packages.${pkgs.stdenv.hostPlatform.system}.build-wrap;
-          ENV_WRAP = lib.getExe self.packages.${pkgs.stdenv.hostPlatform.system}.env-wrap;
-        };
-      });
+            BUILD_WRAP = lib.getExe self.packages.${system}.build-wrap;
+            ENV_WRAP = lib.getExe self.packages.${system}.env-wrap;
+          };
+        }
+      );
 
-      packages = forAllSystems (pkgs: {
+      packages = forAllSystems (system: pkgs: {
         # these two only use stdlib, no need to use cargo
         build-wrap = pkgs.buildRustCrate {
           crateName = "build-wrap";
@@ -62,6 +64,6 @@
         };
       });
 
-      formatter = forAllSystems (pkgs: pkgs.nixfmt-tree);
+      formatter = forAllSystems (system: pkgs: pkgs.nixfmt-tree);
     };
 }
