@@ -23,7 +23,7 @@ pub struct Tool {
 }
 
 impl Tool {
-    fn find(store_dir: &StoreDir, tool_name: &str) -> eyre::Result<Self> {
+    fn find(store_dir: &StoreDir, tool_name: &str, fallback: Option<&str>) -> eyre::Result<Self> {
         let var_name = tool_name.to_uppercase().replace('-', "_");
         let real_path = if let Some(discovered) = std::env::var_os(var_name) {
             which::which(&discovered).wrap_err_with(|| {
@@ -33,6 +33,8 @@ impl Tool {
                     discovered.display()
                 )
             })?
+        } else if let Some(fallback) = fallback {
+            fallback.into()
         } else {
             which::which(tool_name)
                 .wrap_err_with(|| format!("could not find tool {}", tool_name))?
@@ -58,10 +60,10 @@ pub struct Tools {
 impl Tools {
     pub fn find(store_dir: &StoreDir) -> eyre::Result<Self> {
         Ok(Self {
-            rustc: Tool::find(store_dir, "rustc")?,
-            cc: Tool::find(store_dir, "cc")?,
-            env_wrap: Tool::find(store_dir, "env-wrap")?,
-            build_wrap: Tool::find(store_dir, "build-wrap")?,
+            rustc: Tool::find(store_dir, "rustc", None)?,
+            cc: Tool::find(store_dir, "cc", None)?,
+            env_wrap: Tool::find(store_dir, "env-wrap", option_env!("BUILD_WRAP"))?,
+            build_wrap: Tool::find(store_dir, "build-wrap", option_env!("BUILD_WRAP"))?,
         })
     }
 
