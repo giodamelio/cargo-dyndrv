@@ -77,7 +77,13 @@ fn main() -> ExitCode {
             "rustc-link-lib" => push_arg(&mut transitive_file, "-l", value),
             "rustc-link-search" => push_arg(&mut transitive_file, "-L", value),
             "rustc-cfg" => push_arg(&mut immediate_file, "--cfg", value),
-            "rustc-check-cfg" => push_arg(&mut immediate_file, "--check-cfg", value),
+            "rustc-check-cfg" => {
+                // if there are any check-cfg args extra checking is enabled,
+                // which can cause build failures since cargo-dyndrv doesn't
+                // handle cfg resolution.
+                // push_arg(&mut immediate_file, "--check-cfg", value),
+                Ok(())
+            }
             "rustc-flags" => transitive_file.write_all(value.replace(' ', "\n").as_bytes()),
             "rustc-env" => {
                 // the lines format already disallows variables with newlines,

@@ -3,14 +3,14 @@ use std::{
     fmt::Display,
     hash::{Hash, Hasher},
     io::Cursor,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     str::FromStr,
     sync::Arc,
 };
 
 use cargo_metadata::MetadataCommand;
-use color_eyre::eyre::{self, OptionExt as _, WrapErr as _};
+use color_eyre::eyre::{self, ContextCompat, OptionExt as _, WrapErr as _};
 use harmonia_store_content_address::ContentAddressMethodAlgorithm;
 use harmonia_store_derivation::{
     derivation::{Derivation, DerivationOutput},
@@ -137,6 +137,7 @@ fn order_units(
     let unit = &all_units[idx];
     for dep in &unit.dependencies {
         order_units(all_transitive_deps, ordered_units, all_units, dep.index);
+        // Must not attempt to link dependencies of a build.rs
         transitive_deps.append(&mut all_transitive_deps[&dep.index].clone());
         transitive_deps.insert(dep.index);
     }
@@ -236,6 +237,31 @@ fn add_metadata_env(
     );
 
     // TODO: more of these
+}
+
+fn extern_declaration(
+    crate_type: &str,
+    extern_crate_name: &str,
+    out_path: &Path,
+    dep_base_name: &str,
+    dep: &Unit,
+) -> eyre::Result<String> {
+    let dep_crate_type = &dep.target.crate_types[0];
+    let needs_rlib = crate_type == "bin" || crate_type == "proc-macro";
+    let extension = if dep_crate_type == "lib" || dep_crate_type == "rlib" {
+        if needs_rlib { ".rlib" } else { ".rmeta" }
+    } else if dep_crate_type == "dylib" || dep_crate_type == "proc-macro" {
+        ".so"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "{}={}/{}{}",
+        extern_crate_name,
+        out_path.to_str().wrap_err("path not valid utf-8")?,
+        dep_base_name,
+        extension,
+    ))
 }
 
 #[tokio::main]
@@ -358,6 +384,8 @@ async fn main() -> eyre::Result<()> {
         env.insert("HOST".into(), "x86_64-unknown-linux-gnu".into());
         env.insert("TARGET".into(), "x86_64-unknown-linux-gnu".into());
         env.insert("CARGO_CFG_TARGET_OS".into(), "linux".into());
+        env.insert("CARGO_CFG_TARGET_ARCH".into(), "x86_64".into());
+        env.insert("CARGO_CFG_TARGET_POINTER_WIDTH".into(), "64".into());
         add_metadata_env(&mut env, unit_meta);
 
         env.insert(
@@ -571,7 +599,7 @@ async fn main() -> eyre::Result<()> {
                 hasher.finish()
             };
             add_codegen(&mut args, "metadata", &format_args!("{:016x}", dep_hash));
-            let base_name = if unit.target.crate_types.contains(&String::from("lib")) {
+            let base_name = if crate_type == "lib" || crate_type == "proc-macro" {
                 let extra = format!("-{:016x}", dep_hash);
                 add_codegen(&mut args, "extra-filename", &extra);
                 // cargo uses rustc outputs to learn rmeta locations.
@@ -587,15 +615,11 @@ async fn main() -> eyre::Result<()> {
 
             for transitive_dep in &transitive_deps[&unit_idx] {
                 let dep = drv_cache[*transitive_dep].as_ref().unwrap();
+                // Needed for either library deps or OUT_PATH
                 inputs.insert(SingleDerivedPath::Built {
                     drv_path: Arc::new(SingleDerivedPath::Opaque(dep.drv_path.clone())),
                     output: OutputName::default(),
                 });
-
-                let placeholder =
-                    Placeholder::ca_output(&dep.drv_path, &OutputName::default()).render();
-                args.push_back("-L".into());
-                args.push_back(format!("dependency={}", placeholder.display()).into());
 
                 if dep.meta.custom_output {
                     inputs.insert(SingleDerivedPath::Built {
@@ -612,6 +636,11 @@ async fn main() -> eyre::Result<()> {
                     args.push_back(
                         format!("@{}", flags.join(SCRIPT_TRANSITIVE_ARGS).display()).into(),
                     );
+                } else {
+                    let placeholder =
+                        Placeholder::ca_output(&dep.drv_path, &OutputName::default()).render();
+                    args.push_back("-L".into());
+                    args.push_back(format!("dependency={}", placeholder.display()).into());
                 }
             }
 
@@ -624,17 +653,13 @@ async fn main() -> eyre::Result<()> {
                 if let Some(dep_base_name) = dep.meta.base_name.as_ref() {
                     args.push_back("--extern".into());
                     args.push_back(
-                        format!(
-                            "{}={}/{}.{}",
-                            direct_dep.extern_crate_name,
-                            out.display(),
+                        extern_declaration(
+                            crate_type,
+                            &direct_dep.extern_crate_name,
+                            &out,
                             dep_base_name,
-                            if crate_type == "lib" || crate_type == "rlib" {
-                                "rmeta"
-                            } else {
-                                "rlib"
-                            },
-                        )
+                            &unit_graph.units[direct_dep.index],
+                        )?
                         .into(),
                     );
                 }
@@ -656,6 +681,12 @@ async fn main() -> eyre::Result<()> {
                         format!("@{}", flags.join(SCRIPT_IMMEDIATE_ARGS).display()).into(),
                     );
                 }
+            }
+
+            // internal to rustc, but required
+            if crate_type == "proc-macro" {
+                args.push_back("--extern".into());
+                args.push_back("proc_macro".into());
             }
 
             let builder = args.pop_front().unwrap();
