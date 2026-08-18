@@ -22,7 +22,10 @@ use harmonia_store_remote::{DaemonStore, HandshakeDaemonStore as _};
 use harmonia_utils_hash::Algorithm::SHA256;
 use tokio::{io::BufReader, sync::Mutex};
 
+use crate::util::{CloneBytes as _, IntoBytes as _};
+
 mod tools;
+mod util;
 
 const SCRIPT_FLAGS_OUTPUT: &str = "flags";
 const SCRIPT_IMMEDIATE_ARGS: &str = "args-immediate";
@@ -189,6 +192,27 @@ async fn add_to_store_nar<T: DaemonStore>(
     }
 }
 
+async fn add_drv_to_store<T: DaemonStore>(
+    store: &mut T,
+    store_dir: &StoreDir,
+    drv: Derivation,
+    drv_name: &str,
+) -> eyre::Result<StorePath> {
+    let refs = drv.inputs.iter().map(|p| p.root_path().clone()).collect();
+    let bytes = harmonia_store_aterm::print_derivation_aterm(store_dir, &drv.into_full());
+    let source = BufReader::new(Cursor::new(bytes.clone()));
+    Ok(store
+        .add_ca_to_store(
+            &format!("{}.drv", drv_name),
+            ContentAddressMethodAlgorithm::Text,
+            &refs,
+            false,
+            source,
+        )
+        .await?
+        .path)
+}
+
 fn add_metadata_env(
     env: &mut BTreeMap<bytes::Bytes, bytes::Bytes>,
     meta: &cargo_metadata::Package,
@@ -338,11 +362,7 @@ async fn main() -> eyre::Result<()> {
 
         env.insert(
             "CARGO_MANIFEST_DIR".into(),
-            src_path
-                .to_absolute_path(&store_dir)
-                .into_os_string()
-                .into_encoded_bytes()
-                .into(),
+            src_path.to_absolute_path(&store_dir).into_bytes(),
         );
 
         let mut inputs = BTreeSet::from([
@@ -357,18 +377,8 @@ async fn main() -> eyre::Result<()> {
             ));
 
             let mut args = VecDeque::from([
-                tools
-                    .build_wrap
-                    .real_path
-                    .clone()
-                    .into_os_string()
-                    .into_encoded_bytes()
-                    .into(),
-                src_path
-                    .to_absolute_path(&store_dir)
-                    .into_os_string()
-                    .into_encoded_bytes()
-                    .into(),
+                tools.build_wrap.real_path.clone_bytes(),
+                src_path.to_absolute_path(&store_dir).into_bytes(),
                 unit_meta.links.clone().unwrap_or_default().into(),
             ]);
 
@@ -402,17 +412,9 @@ async fn main() -> eyre::Result<()> {
 
                 args.push_front("--".into());
                 for env_file in env_files.into_iter() {
-                    args.push_front(env_file.into_os_string().into_encoded_bytes().into());
+                    args.push_front(env_file.into_bytes());
                 }
-                args.push_front(
-                    tools
-                        .env_wrap
-                        .real_path
-                        .as_os_str()
-                        .as_encoded_bytes()
-                        .to_owned()
-                        .into(),
-                );
+                args.push_front(tools.env_wrap.real_path.clone_bytes());
             }
 
             let Some(executable_dep) = executable_dep else {
@@ -429,32 +431,18 @@ async fn main() -> eyre::Result<()> {
             // flags_dir
             args.push_back(
                 Placeholder::standard_output(&OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap())
-                    .render()
-                    .into_os_string()
-                    .into_encoded_bytes()
-                    .into(),
+                    .into_bytes(),
             );
             // out_dir
-            args.push_back(
-                Placeholder::standard_output(&OutputName::default())
-                    .render()
-                    .into_os_string()
-                    .into_encoded_bytes()
-                    .into(),
-            );
+            args.push_back(Placeholder::standard_output(&OutputName::default()).into_bytes());
             // script
-            args.push_back(
-                {
-                    let mut script =
-                        Placeholder::ca_output(&executable_cache.drv_path, &OutputName::default())
-                            .render();
-                    script.push(&executable_dep.extern_crate_name);
-                    script
-                }
-                .into_os_string()
-                .into_encoded_bytes()
-                .into(),
-            );
+            args.push_back({
+                let mut script =
+                    Placeholder::ca_output(&executable_cache.drv_path, &OutputName::default())
+                        .render();
+                script.push(&executable_dep.extern_crate_name);
+                script.into_bytes()
+            });
 
             if let Some(extern_config) = all_extern_config.get(&unit.pkg_id) {
                 eprintln!("Handling external config for {}", unit.pkg_id);
@@ -530,13 +518,7 @@ async fn main() -> eyre::Result<()> {
 
             // nix derivation args start at argv[1], but we put rustc in here anyway.
             // It's easier to add the wrapper if needed
-            let mut args = VecDeque::from([tools
-                .rustc
-                .real_path
-                .clone()
-                .into_os_string()
-                .into_encoded_bytes()
-                .into()]);
+            let mut args = VecDeque::from([tools.rustc.real_path.clone_bytes()]);
             {
                 // rustc handles finding other source files for us
                 let crate_relative = unit
@@ -546,7 +528,7 @@ async fn main() -> eyre::Result<()> {
                     .wrap_err("internal: crate main is not in crate root???")?;
                 let mut path = src_path.to_absolute_path(&store_dir);
                 path.push(crate_relative);
-                args.push_back(path.into_os_string().into_encoded_bytes().into())
+                args.push_back(path.into_bytes())
             }
 
             add_long(
@@ -658,10 +640,7 @@ async fn main() -> eyre::Result<()> {
                 }
                 if dep.meta.custom_output {
                     inputs.insert(SingleDerivedPath::Opaque(tools.env_wrap.store_path.clone()));
-                    env.insert(
-                        "OUT_DIR".into(),
-                        out.into_os_string().into_encoded_bytes().into(),
-                    );
+                    env.insert("OUT_DIR".into(), out.into_bytes());
                     let flags = Placeholder::ca_output(
                         &dep.drv_path,
                         &OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap(),
@@ -670,22 +649,8 @@ async fn main() -> eyre::Result<()> {
 
                     // reversed since we're pushing from the front
                     args.push_front("--".into());
-                    args.push_front(
-                        flags
-                            .join(SCRIPT_IMMEDIATE_ENV)
-                            .into_os_string()
-                            .into_encoded_bytes()
-                            .into(),
-                    );
-                    args.push_front(
-                        tools
-                            .env_wrap
-                            .real_path
-                            .as_os_str()
-                            .as_encoded_bytes()
-                            .to_owned()
-                            .into(),
-                    );
+                    args.push_front(flags.join(SCRIPT_IMMEDIATE_ENV).into_bytes());
+                    args.push_front(tools.env_wrap.real_path.clone_bytes());
 
                     args.push_back(
                         format!("@{}", flags.join(SCRIPT_IMMEDIATE_ARGS).display()).into(),
@@ -719,21 +684,7 @@ async fn main() -> eyre::Result<()> {
             )
         };
 
-        let drv_path = {
-            let refs = drv.inputs.iter().map(|p| p.root_path().clone()).collect();
-            let bytes = harmonia_store_aterm::print_derivation_aterm(&store_dir, &drv.into_full());
-            let source = BufReader::new(Cursor::new(bytes.clone()));
-            store
-                .add_ca_to_store(
-                    &format!("{}.drv", drv_name),
-                    ContentAddressMethodAlgorithm::Text,
-                    &refs,
-                    false,
-                    source,
-                )
-                .await?
-                .path
-        };
+        let drv_path = add_drv_to_store(&mut store, &store_dir, drv, drv_name).await?;
         drv_cache[unit_idx] = Some(UnitCache { drv_path, meta });
     }
 

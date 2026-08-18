@@ -30,6 +30,8 @@
             # Use nixpkgs rust, fenix rust uses an integrated ld that doesn't set proper rpaths
             rustc
             cargo
+            rustfmt
+            clippy
 
             gdb
             rust-analyzer
