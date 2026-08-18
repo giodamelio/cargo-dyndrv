@@ -38,7 +38,7 @@
       );
 
       packages = forAllSystems (
-        system: pkgs: {
+        system: pkgs: rec {
           # these two only use stdlib, no need to use cargo
           build-wrap = pkgs.buildRustCrate {
             crateName = "build-wrap";
@@ -51,6 +51,27 @@
             version = "0.1.0";
             src = ./env-wrap;
             crateBin = [ { name = "env-wrap"; } ];
+          };
+
+          cargo-dyndrv = pkgs.rustPlatform.buildRustPackage rec {
+            pname = "cargo-dyndrv";
+            version = "0.1.0";
+
+            src = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              outputHashes."harmonia-file-core-3.1.0" = "sha256-hPdQB+DWc/q6w/wnTVGCS8iugEGd60Ym3x2eWvVw3ss=";
+            };
+
+            cargoBuildFlags = [
+              "--bin"
+              pname
+            ];
+
+            env = {
+              BUILD_WRAP = lib.getExe build-wrap;
+              ENV_WRAP = lib.getExe env-wrap;
+            };
           };
         }
       );
