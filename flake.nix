@@ -74,6 +74,8 @@
               LN = lib.getExe' pkgs.coreutils "ln";
             };
           };
+
+          writeExtern = pkgs.callPackage ./nix/write-extern.nix { };
         }
       );
 
