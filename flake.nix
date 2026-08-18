@@ -71,6 +71,7 @@
             env = {
               BUILD_WRAP = lib.getExe build-wrap;
               ENV_WRAP = lib.getExe env-wrap;
+              LN = lib.getExe' pkgs.coreutils "ln";
             };
           };
         }

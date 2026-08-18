@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt::Display,
     hash::{Hash, Hasher},
-    io::Cursor,
     path::{Path, PathBuf},
     process::Stdio,
     str::FromStr,
@@ -18,12 +17,12 @@ use harmonia_store_derivation::{
     placeholder::Placeholder,
 };
 use harmonia_store_path::{FromStoreDirStr, StoreDir, StorePath, StorePathName};
-use harmonia_store_remote::{DaemonStore, HandshakeDaemonStore as _};
+use harmonia_store_remote::HandshakeDaemonStore as _;
 use harmonia_utils_hash::Algorithm::SHA256;
-use tokio::{io::BufReader, sync::Mutex};
 
 use crate::util::{CloneBytes as _, IntoBytes as _};
 
+mod store;
 mod tools;
 mod util;
 
@@ -159,59 +158,6 @@ fn add_codegen<T: Display>(args: &mut VecDeque<bytes::Bytes>, option: &str, valu
 fn add_feature(args: &mut VecDeque<bytes::Bytes>, feature: &str) {
     args.push_back("--cfg".into());
     args.push_back(format!("feature=\"{}\"", feature).into());
-}
-
-async fn add_to_store_nar<T: DaemonStore>(
-    store: &mut T,
-    real_path: PathBuf,
-    name: &str,
-) -> eyre::Result<StorePath> {
-    static CACHE_MUTEX: Mutex<Option<HashMap<PathBuf, StorePath>>> = Mutex::const_new(None);
-    let mut guard = CACHE_MUTEX.lock().await;
-    let cache = guard.get_or_insert_default();
-
-    if let Some(store_path) = cache.get(&real_path) {
-        Ok(store_path.clone())
-    } else {
-        // TODO: Don't put the entire nar in memory
-        let mut encoder = nix_nar::Encoder::new(&real_path)?;
-        let mut buf = Vec::new();
-        std::io::copy(&mut encoder, &mut buf)?;
-        let reader = BufReader::new(Cursor::new(buf));
-        let store_path = store
-            .add_ca_to_store(
-                name,
-                ContentAddressMethodAlgorithm::NixArchive(SHA256),
-                &Default::default(),
-                false,
-                reader,
-            )
-            .await?
-            .path;
-        cache.insert(real_path, store_path.clone());
-        Ok(store_path)
-    }
-}
-
-async fn add_drv_to_store<T: DaemonStore>(
-    store: &mut T,
-    store_dir: &StoreDir,
-    drv: Derivation,
-    drv_name: &str,
-) -> eyre::Result<StorePath> {
-    let refs = drv.inputs.iter().map(|p| p.root_path().clone()).collect();
-    let bytes = harmonia_store_aterm::print_derivation_aterm(store_dir, &drv.into_full());
-    let source = BufReader::new(Cursor::new(bytes.clone()));
-    Ok(store
-        .add_ca_to_store(
-            &format!("{}.drv", drv_name),
-            ContentAddressMethodAlgorithm::Text,
-            &refs,
-            false,
-            source,
-        )
-        .await?
-        .path)
 }
 
 fn add_metadata_env(
@@ -369,7 +315,7 @@ async fn main() -> eyre::Result<()> {
 
         let drv_name = crate_root.file_name().ok_or_eyre("empty path")?;
 
-        let src_path = add_to_store_nar(
+        let src_path = store::add_to_store_nar(
             &mut store,
             crate_root.to_path_buf().into(),
             &format!("{}-src", drv_name),
@@ -715,15 +661,24 @@ async fn main() -> eyre::Result<()> {
             )
         };
 
-        let drv_path = add_drv_to_store(&mut store, &store_dir, drv, drv_name).await?;
+        let drv_path = store::add_drv_to_store(&mut store, &store_dir, drv, drv_name).await?;
         drv_cache[unit_idx] = Some(UnitCache { drv_path, meta });
     }
 
     for unit_idx in unit_graph.roots {
-        println!(
-            "{}",
-            store_dir.display(&drv_cache[unit_idx].as_ref().unwrap().drv_path)
-        );
+        let drv_path = &drv_cache[unit_idx].as_ref().unwrap().drv_path;
+        println!("{}", store_dir.display(drv_path));
+        // TODO: need more handling if there is both a lib and a bin of the same crate
+        if store::is_in_derivation() {
+            store::submit_wrapper(
+                &mut store,
+                &store_dir,
+                &tools.ln,
+                &unit_graph.units[unit_idx].target.name,
+                drv_path,
+            )
+            .await?;
+        }
     }
 
     // TODO: run the build if we are outside a derivation,
