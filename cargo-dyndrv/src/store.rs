@@ -112,7 +112,7 @@ pub async fn submit_wrappers<T: DaemonStore>(
         inputs: outputs
             .values()
             .map(|drv_path| SingleDerivedPath::Built {
-                drv_path: Arc::new(SingleDerivedPath::Opaque(drv_path.clone().clone())),
+                drv_path: Arc::new(SingleDerivedPath::Opaque((*drv_path).clone())),
                 output: OutputName::default(),
             })
             .chain([SingleDerivedPath::Opaque(ln.store_path.clone())])
