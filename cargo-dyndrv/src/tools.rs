@@ -52,6 +52,7 @@ impl Tool {
 
 pub struct Tools {
     pub rustc: Tool,
+    pub cargo: Tool,
     pub cc: Tool,
     pub env_wrap: Tool,
     pub build_wrap: Tool,
@@ -62,8 +63,9 @@ impl Tools {
     pub fn find(store_dir: &StoreDir) -> eyre::Result<Self> {
         Ok(Self {
             rustc: Tool::find(store_dir, "rustc", None)?,
+            cargo: Tool::find(store_dir, "cargo", None)?,
             cc: Tool::find(store_dir, "cc", None)?,
-            env_wrap: Tool::find(store_dir, "env-wrap", option_env!("BUILD_WRAP"))?,
+            env_wrap: Tool::find(store_dir, "env-wrap", option_env!("ENV_WRAP"))?,
             build_wrap: Tool::find(store_dir, "build-wrap", option_env!("BUILD_WRAP"))?,
             ln: Tool::find(store_dir, "ln", option_env!("LN"))?,
         })

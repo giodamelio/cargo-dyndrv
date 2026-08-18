@@ -1,11 +1,11 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
     str::FromStr,
     sync::{Arc, OnceLock},
 };
 
-use color_eyre::eyre;
+use color_eyre::eyre::{self, Context};
 use harmonia_store_content_address::ContentAddressMethodAlgorithm;
 use harmonia_store_derivation::{
     derivation::{Derivation, DerivationOutput},
@@ -25,6 +25,18 @@ use crate::{
 pub fn is_in_derivation() -> bool {
     static VALUE: OnceLock<bool> = OnceLock::new();
     *VALUE.get_or_init(|| std::env::var_os("NIX_BUILD_TOP").is_some())
+}
+
+pub fn daemon_path() -> PathBuf {
+    if let Ok(from_env) = std::env::var("NIX_REMOTE") {
+        from_env
+            .strip_prefix("unix://")
+            .map(ToString::to_string)
+            .unwrap_or(from_env)
+            .into()
+    } else {
+        "/nix/var/nix/daemon-socket/socket".into()
+    }
 }
 
 pub async fn add_to_store_nar<T: DaemonStore>(
@@ -78,51 +90,71 @@ pub async fn add_drv_to_store<T: DaemonStore>(
         .path)
 }
 
-pub async fn submit_wrapper<T: DaemonStore>(
+pub async fn submit_wrappers<T: DaemonStore>(
     store: &mut T,
     store_dir: &StoreDir,
     ln: &Tool,
-    output_name: &str,
-    orig_drv: &StorePath,
+    outputs: &BTreeMap<&str, &StorePath>,
 ) -> eyre::Result<()> {
-    let name = format!("cargo-dyndrv-build-{}", output_name);
     // We're only allowed to submit if the name is correct.
     // The easiest way to do this without breaking the inner loop is a symlink
     let wrapper_drv = Derivation {
-        name: StorePathName::from_str(&name)?,
-        outputs: BTreeMap::from([(
-            OutputName::default(),
-            DerivationOutput::CAFloating(ContentAddressMethodAlgorithm::NixArchive(SHA256)),
-        )]),
-        inputs: BTreeSet::from([
-            SingleDerivedPath::Opaque(ln.store_path.clone()),
-            SingleDerivedPath::Built {
-                drv_path: Arc::new(SingleDerivedPath::Opaque(orig_drv.clone())),
+        name: StorePathName::from_str("cargo-dyndrv-build.drv")?,
+        outputs: outputs
+            .keys()
+            .map(|name| {
+                Ok((
+                    OutputName::from_str(name).wrap_err("crate name is not valid output")?,
+                    DerivationOutput::CAFloating(ContentAddressMethodAlgorithm::NixArchive(SHA256)),
+                ))
+            })
+            .collect::<eyre::Result<_>>()?,
+        inputs: outputs
+            .values()
+            .map(|drv_path| SingleDerivedPath::Built {
+                drv_path: Arc::new(SingleDerivedPath::Opaque(drv_path.clone().clone())),
                 output: OutputName::default(),
-            },
-        ]),
+            })
+            .chain([SingleDerivedPath::Opaque(ln.store_path.clone())])
+            .collect(),
         platform: "x86_64-linux".into(),
-        builder: ln.real_path.clone_bytes(),
-        args: vec![
-            "-s".into(),
-            // We can't reference environment variables, so use placeholders
-            Placeholder::standard_output(&OutputName::default())
-                .render()
-                .into_bytes(),
-            Placeholder::ca_output(orig_drv, &OutputName::default())
-                .render()
-                .into_bytes(),
-        ],
+        builder: "/bin/sh".into(),
+        args: Vec::from([
+            "-c".into(),
+            outputs
+                .iter()
+                .map(|(name, drv_path)| {
+                    let dest =
+                        Placeholder::standard_output(&OutputName::from_str(name).unwrap()).render();
+                    let src = Placeholder::ca_output(drv_path, &OutputName::default()).render();
+
+                    let mut buf = bytes::BytesMut::new();
+                    buf.extend(ln.real_path.clone_bytes());
+                    buf.extend_from_slice(" -s ".as_bytes());
+                    buf.extend(src.into_bytes());
+                    buf.extend(" ".as_bytes());
+                    buf.extend(dest.into_bytes());
+                    buf.extend(";".as_bytes());
+
+                    buf.into()
+                })
+                .fold(bytes::BytesMut::new(), |mut acc, rhs: bytes::Bytes| {
+                    acc.extend(rhs);
+                    acc
+                })
+                .into(),
+        ]),
         env: BTreeMap::new(),
         structured_attrs: None,
     };
 
-    let wrapper_drv_path = add_drv_to_store(store, store_dir, wrapper_drv, &name).await?;
+    let wrapper_drv_path =
+        add_drv_to_store(store, store_dir, wrapper_drv, "cargo-dyndrv-build").await?;
 
     store
         .submit_output(
             &SingleDerivedPath::Opaque(wrapper_drv_path),
-            &OutputName::from_str(&name)?,
+            &OutputName::default(),
         )
         .await?;
 

@@ -214,20 +214,34 @@ fn extern_declaration(
 async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
 
+    // Someone might want a different one for some reason, idk how to get it
+    let store_dir = StoreDir::default();
+    let mut store = harmonia_store_remote::DaemonClientBuilder::new()
+        .set_store_dir(&store_dir)
+        .build_unix(store::daemon_path())
+        .await?
+        .handshake()
+        .await?;
+
+    let tools = tools::Tools::find(&store_dir)?;
+
     // TODO: accept this via some argument
 
-    let all_extern_config: BTreeMap<String, ExternConfig> =
-        if let Ok(content) = std::fs::read_to_string("extern.json") {
+    let all_extern_config: BTreeMap<String, ExternConfig> = {
+        let extern_path = std::env::var("EXTERN_PATH").unwrap_or("extern.json".to_string());
+
+        if let Ok(content) = std::fs::read_to_string(extern_path) {
             serde_json::from_str(&content).context("Could not parse extern configuration")?
         } else {
             Default::default()
-        };
+        }
+    };
 
     // Shelling out to `cargo` since the cargo crate does not provide what we need
     let sys_args: Vec<_> = std::env::args().collect();
 
     let unit_graph: UnitGraph = {
-        let output = std::process::Command::new("cargo")
+        let output = std::process::Command::new(&tools.cargo.real_path)
             .args(&sys_args[1..])
             .arg("-Z")
             .arg("unstable-options")
@@ -251,6 +265,7 @@ async fn main() -> eyre::Result<()> {
     // The package ids match the unit graph, so we can index on them
     let package_metadata: HashMap<_, _> = {
         let mut command = MetadataCommand::new();
+        command.cargo_path(tools.cargo.real_path.clone());
         let mut idx = 1;
         loop {
             if idx >= sys_args.len() - 1 {
@@ -286,17 +301,6 @@ async fn main() -> eyre::Result<()> {
         }
         (units, transitive_deps)
     };
-
-    // Someone might want a different one for some reason, idk how to get it
-    let store_dir = StoreDir::default();
-    let mut store = harmonia_store_remote::DaemonClientBuilder::new()
-        .set_store_dir(&store_dir)
-        .build_daemon()
-        .await?
-        .handshake()
-        .await?;
-
-    let tools = tools::Tools::find(&store_dir)?;
 
     let base_env = tools.base_environment();
 
@@ -665,20 +669,16 @@ async fn main() -> eyre::Result<()> {
         drv_cache[unit_idx] = Some(UnitCache { drv_path, meta });
     }
 
+    let mut drvs = BTreeMap::new();
     for unit_idx in unit_graph.roots {
         let drv_path = &drv_cache[unit_idx].as_ref().unwrap().drv_path;
         println!("{}", store_dir.display(drv_path));
-        // TODO: need more handling if there is both a lib and a bin of the same crate
-        if store::is_in_derivation() {
-            store::submit_wrapper(
-                &mut store,
-                &store_dir,
-                &tools.ln,
-                &unit_graph.units[unit_idx].target.name,
-                drv_path,
-            )
-            .await?;
-        }
+        drvs.insert(unit_graph.units[unit_idx].target.name.as_str(), drv_path);
+    }
+
+    // TODO: need more handling if there is both a lib and a bin of the same crate
+    if store::is_in_derivation() {
+        store::submit_wrappers(&mut store, &store_dir, &tools.ln, &drvs).await?;
     }
 
     // TODO: run the build if we are outside a derivation,

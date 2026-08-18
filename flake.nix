@@ -73,9 +73,12 @@
               ENV_WRAP = lib.getExe env-wrap;
               LN = lib.getExe' pkgs.coreutils "ln";
             };
+
+            meta.mainProgram = "cargo-dyndrv";
           };
 
           writeExtern = pkgs.callPackage ./nix/write-extern.nix { };
+          buildCrate = pkgs.callPackage ./nix/build-crate.nix { inherit writeExtern cargo-dyndrv; };
         }
       );
 
