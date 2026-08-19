@@ -1,8 +1,8 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, OnceLock},
+    sync::{Arc, LazyLock, OnceLock},
 };
 
 use color_eyre::eyre::{self, Context};
@@ -18,9 +18,17 @@ use harmonia_utils_hash::Algorithm::SHA256;
 use tokio::sync::Mutex;
 
 use crate::{
-    tools::Tool,
+    tools::{Tool, Tools},
     util::{CloneBytes, IntoBytes},
 };
+
+// TODO: won't work on all platforms, perhaps could be truly static
+pub static PLATFORM: LazyLock<bytes::Bytes> =
+    LazyLock::new(|| format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS).into());
+
+pub static OUTPUT_OUT: LazyLock<OutputName> = LazyLock::new(OutputName::default);
+pub static OUTPUT_FLAGS: LazyLock<OutputName> =
+    LazyLock::new(|| OutputName::from_str("flags").unwrap());
 
 pub fn is_in_derivation() -> bool {
     static VALUE: OnceLock<bool> = OnceLock::new();
@@ -113,11 +121,11 @@ pub async fn submit_wrappers<T: DaemonStore>(
             .values()
             .map(|drv_path| SingleDerivedPath::Built {
                 drv_path: Arc::new(SingleDerivedPath::Opaque((*drv_path).clone())),
-                output: OutputName::default(),
+                output: OUTPUT_OUT.clone(),
             })
             .chain([SingleDerivedPath::Opaque(ln.store_path.clone())])
             .collect(),
-        platform: "x86_64-linux".into(),
+        platform: PLATFORM.clone(),
         builder: "/bin/sh".into(),
         args: Vec::from([
             "-c".into(),
@@ -126,7 +134,7 @@ pub async fn submit_wrappers<T: DaemonStore>(
                 .map(|(name, drv_path)| {
                     let dest =
                         Placeholder::standard_output(&OutputName::from_str(name).unwrap()).render();
-                    let src = Placeholder::ca_output(drv_path, &OutputName::default()).render();
+                    let src = Placeholder::ca_output(drv_path, &OUTPUT_OUT).render();
 
                     let mut buf = bytes::BytesMut::new();
                     buf.extend(ln.real_path.clone_bytes());
@@ -152,11 +160,51 @@ pub async fn submit_wrappers<T: DaemonStore>(
         add_drv_to_store(store, store_dir, wrapper_drv, "cargo-dyndrv-build").await?;
 
     store
-        .submit_output(
-            &SingleDerivedPath::Opaque(wrapper_drv_path),
-            &OutputName::default(),
-        )
+        .submit_output(&SingleDerivedPath::Opaque(wrapper_drv_path), &OUTPUT_OUT)
         .await?;
 
     Ok(())
+}
+
+pub async fn target_env_drv<T: DaemonStore>(
+    store: &mut T,
+    store_dir: &StoreDir,
+    tools: &Tools,
+    target: &Option<String>,
+) -> eyre::Result<StorePath> {
+    static CACHE_MUTEX: Mutex<Option<HashMap<Option<String>, StorePath>>> = Mutex::const_new(None);
+    let mut guard = CACHE_MUTEX.lock().await;
+    let cache = guard.get_or_insert_default();
+    if let Some(cached) = cache.get(target) {
+        return Ok(cached.clone());
+    }
+
+    let name = StorePathName::from_str(&format!(
+        "cargo-cfg-{}",
+        target.as_deref().unwrap_or("host")
+    ))?;
+    let drv = Derivation {
+        name: name.clone(),
+        outputs: BTreeMap::from([(
+            OUTPUT_OUT.clone(),
+            DerivationOutput::CAFloating(ContentAddressMethodAlgorithm::Flat(SHA256)),
+        )]),
+        inputs: BTreeSet::from([
+            SingleDerivedPath::Opaque(tools.rustc.store_path.clone()),
+            SingleDerivedPath::Opaque(tools.target_env.store_path.clone()),
+        ]),
+        platform: PLATFORM.clone(),
+        builder: tools.target_env.real_path.clone_bytes(),
+        args: Vec::from([
+            tools.rustc.real_path.clone_bytes(),
+            target.clone().unwrap_or_default().into(),
+            Placeholder::standard_output(&OUTPUT_OUT)
+                .render()
+                .clone_bytes(),
+        ]),
+        env: BTreeMap::new(),
+        structured_attrs: None,
+    };
+
+    add_drv_to_store(store, store_dir, drv, &name).await
 }

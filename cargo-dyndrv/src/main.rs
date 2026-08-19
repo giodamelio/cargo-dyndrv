@@ -4,7 +4,7 @@ use std::{
     hash::{Hash, Hasher},
     path::Path,
     str::FromStr,
-    sync::{Arc, LazyLock},
+    sync::Arc,
 };
 
 use cargo_metadata::MetadataCommand;
@@ -12,7 +12,7 @@ use color_eyre::eyre::{self, ContextCompat, OptionExt as _, WrapErr as _};
 use harmonia_store_content_address::ContentAddressMethodAlgorithm;
 use harmonia_store_derivation::{
     derivation::{Derivation, DerivationOutput},
-    derived_path::{OutputName, SingleDerivedPath},
+    derived_path::SingleDerivedPath,
     placeholder::Placeholder,
 };
 use harmonia_store_path::{FromStoreDirStr, StoreDir, StorePath, StorePathName};
@@ -20,6 +20,7 @@ use harmonia_store_remote::HandshakeDaemonStore as _;
 use harmonia_utils_hash::Algorithm::SHA256;
 
 use crate::{
+    store::{OUTPUT_FLAGS, OUTPUT_OUT, PLATFORM},
     unit_graph::{CompileMode, Unit, UnitGraph},
     util::{CloneBytes as _, IntoBytes as _},
 };
@@ -28,10 +29,6 @@ mod store;
 mod tools;
 mod unit_graph;
 mod util;
-
-static OUTPUT_OUT: LazyLock<OutputName> = LazyLock::new(OutputName::default);
-static OUTPUT_FLAGS: LazyLock<OutputName> =
-    LazyLock::new(|| OutputName::from_str("flags").unwrap());
 
 const SCRIPT_IMMEDIATE_ARGS: &str = "args-immediate";
 const SCRIPT_TRANSITIVE_ARGS: &str = "args-transitive";
@@ -264,29 +261,32 @@ async fn main() -> eyre::Result<()> {
         let (drv, meta) = if unit.mode == CompileMode::RunCustomBuild {
             // TODO cfg flags set by dependencies, perhaps it could go through the same
             // path as metadata
-            // Might require a wrapper, since cfg items set from build scripts will affect this
-            // host can come from `rustc --print=host-tuple`
-            env.insert("HOST".into(), "x86_64-unknown-linux-gnu".into());
-            env.insert("TARGET".into(), "x86_64-unknown-linux-gnu".into());
-            env.insert("CARGO_CFG_TARGET_OS".into(), "linux".into());
-            env.insert("CARGO_CFG_TARGET_ARCH".into(), "x86_64".into());
-            env.insert("CARGO_CFG_TARGET_POINTER_WIDTH".into(), "64".into());
-
             inputs.insert(SingleDerivedPath::Opaque(
                 tools.build_wrap.store_path.clone(),
             ));
+            inputs.insert(SingleDerivedPath::Opaque(tools.env_wrap.store_path.clone()));
 
-            let mut args = VecDeque::from([
-                tools.build_wrap.real_path.clone_bytes(),
-                src_path.to_absolute_path(&store_dir).into_bytes(),
-                unit_meta.links.clone().unwrap_or_default().into(),
-            ]);
+            let mut args = Vec::new();
+
+            // args that need rustc to calculate (e.g. CARGO_CFG_TARGET_OS, HOST, TARGET)
+            {
+                let target_env_drv =
+                    store::target_env_drv(&mut store, &store_dir, &tools, &unit.platform).await?;
+                args.push(
+                    Placeholder::ca_output(&target_env_drv, &OUTPUT_OUT)
+                        .render()
+                        .into_bytes(),
+                );
+                inputs.insert(SingleDerivedPath::Built {
+                    drv_path: Arc::new(SingleDerivedPath::Opaque(target_env_drv)),
+                    output: OUTPUT_OUT.clone(),
+                });
+            }
 
             let mut executable_dep = None;
             // cargo gives us a few dependencies.
             // one has the actual built executable, the others are build script
             // executions of dependencies that set metadata
-            let mut env_files = Vec::new();
             for dep in &unit.dependencies {
                 let dep_cache = drv_cache[dep.index].as_ref().expect("units out of order");
                 let dep_unit = &unit_graph.units[dep.index];
@@ -298,20 +298,8 @@ async fn main() -> eyre::Result<()> {
                         output: OUTPUT_FLAGS.clone(),
                     });
                     let flags = Placeholder::ca_output(&dep_cache.drv_path, &OUTPUT_FLAGS);
-                    env_files.push(flags.render().join(SCRIPT_METADATA_ENV));
+                    args.push(flags.render().join(SCRIPT_METADATA_ENV).into_bytes());
                 }
-            }
-
-            if !env_files.is_empty() {
-                inputs.insert(SingleDerivedPath::Opaque(tools.env_wrap.store_path.clone()));
-
-                // reversed since we're pushing from the front
-
-                args.push_front("--".into());
-                for env_file in env_files.into_iter() {
-                    args.push_front(env_file.into_bytes());
-                }
-                args.push_front(tools.env_wrap.real_path.clone_bytes());
             }
 
             let Some(executable_dep) = executable_dep else {
@@ -325,12 +313,21 @@ async fn main() -> eyre::Result<()> {
                 drv_path: Arc::new(SingleDerivedPath::Opaque(executable_cache.drv_path.clone())),
                 output: OUTPUT_OUT.clone(),
             });
+
+            // terminate env-wrap args
+            args.push("--".into());
+            // build-wrap executable (running inside env-wrap)
+            args.push(tools.build_wrap.real_path.clone_bytes());
+            // cwd (directory for build.rs exeuction)
+            args.push(src_path.to_absolute_path(&store_dir).into_bytes());
+            // links_key
+            args.push(unit_meta.links.clone().unwrap_or_default().into());
             // flags_dir
-            args.push_back(Placeholder::standard_output(&OUTPUT_FLAGS).into_bytes());
+            args.push(Placeholder::standard_output(&OUTPUT_FLAGS).into_bytes());
             // out_dir
-            args.push_back(Placeholder::standard_output(&OUTPUT_OUT).into_bytes());
+            args.push(Placeholder::standard_output(&OUTPUT_OUT).into_bytes());
             // script
-            args.push_back({
+            args.push({
                 let mut script =
                     Placeholder::ca_output(&executable_cache.drv_path, &OUTPUT_OUT).render();
                 script.push(&executable_dep.extern_crate_name);
@@ -365,7 +362,6 @@ async fn main() -> eyre::Result<()> {
 
             env.insert("OPT_LEVEL".into(), unit.profile.opt_level.clone().into());
 
-            let builder = args.pop_front().unwrap();
             (
                 Derivation {
                     name: StorePathName::from_str(&format!("{}-run", drv_name))
@@ -385,9 +381,9 @@ async fn main() -> eyre::Result<()> {
                         ),
                     ]),
                     inputs,
-                    platform: "x86_64-linux".into(),
-                    builder,
-                    args: args.into(),
+                    platform: PLATFORM.clone(),
+                    builder: tools.env_wrap.real_path.clone_bytes(),
+                    args,
                     // TODO: cargo build script environment variables
                     // (https://doc.rust-lang.org/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts)
                     env,
@@ -554,7 +550,7 @@ async fn main() -> eyre::Result<()> {
                         )),
                     )]),
                     inputs,
-                    platform: "x86_64-linux".into(),
+                    platform: PLATFORM.clone(),
                     builder,
                     args: args.into(),
                     // TODO: cargo crate environment variables

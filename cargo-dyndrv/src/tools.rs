@@ -56,6 +56,7 @@ pub struct Tools {
     pub cc: Tool,
     pub env_wrap: Tool,
     pub build_wrap: Tool,
+    pub target_env: Tool,
     pub ln: Tool,
 }
 
@@ -67,6 +68,7 @@ impl Tools {
             cc: Tool::find(store_dir, "cc", None)?,
             env_wrap: Tool::find(store_dir, "env-wrap", option_env!("ENV_WRAP"))?,
             build_wrap: Tool::find(store_dir, "build-wrap", option_env!("BUILD_WRAP"))?,
+            target_env: Tool::find(store_dir, "target-env", option_env!("TARGET_ENV"))?,
             ln: Tool::find(store_dir, "ln", option_env!("LN"))?,
         })
     }
