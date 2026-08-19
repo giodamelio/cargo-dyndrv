@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
 
@@ -50,6 +51,11 @@ impl Tool {
             store_path,
             real_path,
         })
+    }
+
+    pub fn path_entry(&self) -> &[u8] {
+        // any binary in the nix store should have a parent, it cannot be `/`
+        self.real_path.parent().unwrap().as_os_str().as_bytes()
     }
 }
 

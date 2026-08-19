@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt::Display,
     hash::{Hash, Hasher},
-    os::unix::ffi::OsStrExt,
     path::Path,
     str::FromStr,
     sync::Arc,
@@ -244,8 +243,7 @@ async fn main() -> eyre::Result<()> {
         )
         .await?;
 
-        let mut path: bytes::BytesMut =
-            tools.rustc.real_path.parent().unwrap().clone_bytes().into();
+        let mut path: bytes::BytesMut = tools.rustc.path_entry().into();
 
         let mut env = base_env.clone();
         // TODO: more cargo env vars not from cargo metadata
@@ -272,15 +270,7 @@ async fn main() -> eyre::Result<()> {
 
             // some build scripts won't work if it can't find the CC in PATH
             path.extend_from_slice(b":");
-            path.extend_from_slice(
-                tools
-                    .host_cc
-                    .real_path
-                    .parent()
-                    .unwrap()
-                    .as_os_str()
-                    .as_bytes(),
-            );
+            path.extend_from_slice(tools.host_cc.path_entry());
 
             // unit graph uses an empty platform to mean native
             if unit.platform.is_some() {
@@ -293,15 +283,7 @@ async fn main() -> eyre::Result<()> {
                 env.insert("CC".into(), tools.target_cc.real_path.clone_bytes());
                 env.insert("CXX".into(), tools.target_cxx.real_path.clone_bytes());
                 path.extend_from_slice(b":");
-                path.extend_from_slice(
-                    tools
-                        .target_cc
-                        .real_path
-                        .parent()
-                        .unwrap()
-                        .as_os_str()
-                        .as_bytes(),
-                );
+                path.extend_from_slice(tools.target_cc.path_entry());
             } else {
                 env.insert("CC".into(), tools.host_cc.real_path.clone_bytes());
                 env.insert("CXX".into(), tools.host_cxx.real_path.clone_bytes());
