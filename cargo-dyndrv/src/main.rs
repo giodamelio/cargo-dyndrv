@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt::Display,
     hash::{Hash, Hasher},
+    os::unix::ffi::OsStrExt,
     path::Path,
     str::FromStr,
     sync::Arc,
@@ -243,6 +244,9 @@ async fn main() -> eyre::Result<()> {
         )
         .await?;
 
+        let mut path: bytes::BytesMut =
+            tools.rustc.real_path.parent().unwrap().clone_bytes().into();
+
         let mut env = base_env.clone();
         // TODO: more cargo env vars not from cargo metadata
         add_metadata_env(&mut env, unit_meta);
@@ -266,6 +270,18 @@ async fn main() -> eyre::Result<()> {
             env.insert("HOST_CC".into(), tools.host_cc.real_path.clone_bytes());
             env.insert("HOST_CXX".into(), tools.host_cxx.real_path.clone_bytes());
 
+            // some build scripts won't work if it can't find the CC in PATH
+            path.extend_from_slice(b":");
+            path.extend_from_slice(
+                tools
+                    .host_cc
+                    .real_path
+                    .parent()
+                    .unwrap()
+                    .as_os_str()
+                    .as_bytes(),
+            );
+
             // unit graph uses an empty platform to mean native
             if unit.platform.is_some() {
                 inputs.insert(SingleDerivedPath::Opaque(
@@ -276,6 +292,16 @@ async fn main() -> eyre::Result<()> {
                 ));
                 env.insert("CC".into(), tools.target_cc.real_path.clone_bytes());
                 env.insert("CXX".into(), tools.target_cxx.real_path.clone_bytes());
+                path.extend_from_slice(b":");
+                path.extend_from_slice(
+                    tools
+                        .target_cc
+                        .real_path
+                        .parent()
+                        .unwrap()
+                        .as_os_str()
+                        .as_bytes(),
+                );
             } else {
                 env.insert("CC".into(), tools.host_cc.real_path.clone_bytes());
                 env.insert("CXX".into(), tools.host_cxx.real_path.clone_bytes());
@@ -368,13 +394,10 @@ async fn main() -> eyre::Result<()> {
                     env.insert(var.clone().into(), value.clone().into());
                 }
 
-                let mut path: bytes::BytesMut =
-                    env.remove(&bytes::Bytes::from("PATH")).unwrap().into();
                 for item in &extern_config.extra_path {
                     path.extend_from_slice(b":");
                     path.extend_from_slice(item.as_bytes());
                 }
-                env.insert("PATH".into(), path.into());
             }
 
             for feature in &unit.features {
@@ -383,7 +406,7 @@ async fn main() -> eyre::Result<()> {
             }
 
             env.insert("OPT_LEVEL".into(), unit.profile.opt_level.clone().into());
-
+            env.insert("PATH".into(), path.into());
             (
                 Derivation {
                     name: StorePathName::from_str(&format!("{}-run", drv_name))
@@ -578,6 +601,7 @@ async fn main() -> eyre::Result<()> {
                 args.push_back("proc_macro".into());
             }
 
+            env.insert("PATH".into(), path.into());
             let builder = args.pop_front().unwrap();
             (
                 Derivation {

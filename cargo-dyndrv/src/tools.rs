@@ -7,7 +7,7 @@ use bytes::Bytes;
 use color_eyre::eyre::{self, Context as _};
 use harmonia_store_path::{StoreDir, StorePath};
 
-use crate::util::{CloneBytes, IntoBytes};
+use crate::util::CloneBytes;
 
 fn containing_store_path(store_dir: &StoreDir, path: &Path) -> Option<StorePath> {
     let mut components = path.strip_prefix(store_dir.to_path()).ok()?.components();
@@ -90,14 +90,6 @@ impl Tools {
     }
 
     pub fn base_environment(&self) -> BTreeMap<Bytes, Bytes> {
-        // technially rustc doesn't need to be in path,
-        // they could just be variables and codegen args,
-        // but build.rs scripts make assumptions
-        let path = self.rustc.real_path.parent().unwrap().to_owned();
-
-        BTreeMap::from([
-            ("PATH".into(), path.into_bytes()),
-            ("RUSTC".into(), self.rustc.real_path.clone_bytes()),
-        ])
+        BTreeMap::from([("RUSTC".into(), self.rustc.real_path.clone_bytes())])
     }
 }
