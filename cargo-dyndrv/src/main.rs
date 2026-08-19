@@ -254,11 +254,33 @@ async fn main() -> eyre::Result<()> {
 
         let mut inputs = BTreeSet::from([
             SingleDerivedPath::Opaque(tools.rustc.store_path.clone()),
-            SingleDerivedPath::Opaque(tools.cc.store_path.clone()),
             SingleDerivedPath::Opaque(src_path.clone()),
         ]);
 
         let (drv, meta) = if unit.mode == CompileMode::RunCustomBuild {
+            // running build scripts always get HOST_CC/HOST_CXX, but if the target is local
+            // (e.g. a build script for a dependency of a build script) its CC will be HOST_CC,
+            // not the target CC
+            inputs.insert(SingleDerivedPath::Opaque(tools.host_cc.store_path.clone()));
+            inputs.insert(SingleDerivedPath::Opaque(tools.host_cxx.store_path.clone()));
+            env.insert("HOST_CC".into(), tools.host_cc.real_path.clone_bytes());
+            env.insert("HOST_CXX".into(), tools.host_cxx.real_path.clone_bytes());
+
+            // unit graph uses an empty platform to mean native
+            if unit.platform.is_some() {
+                inputs.insert(SingleDerivedPath::Opaque(
+                    tools.target_cc.store_path.clone(),
+                ));
+                inputs.insert(SingleDerivedPath::Opaque(
+                    tools.target_cxx.store_path.clone(),
+                ));
+                env.insert("CC".into(), tools.target_cc.real_path.clone_bytes());
+                env.insert("CXX".into(), tools.target_cxx.real_path.clone_bytes());
+            } else {
+                env.insert("CC".into(), tools.host_cc.real_path.clone_bytes());
+                env.insert("CXX".into(), tools.host_cxx.real_path.clone_bytes());
+            }
+
             // TODO cfg flags set by dependencies, perhaps it could go through the same
             // path as metadata
             inputs.insert(SingleDerivedPath::Opaque(
@@ -533,6 +555,23 @@ async fn main() -> eyre::Result<()> {
                 }
             }
 
+            if let Some(ref target) = unit.platform {
+                add_long(&mut args, "target", target);
+            }
+
+            {
+                // rustc doesn't respect CC environment variable
+                // unix-like platforms use cc as linker
+                // this won't work for wasm, though.
+                let cc = if unit.platform.is_some() {
+                    &tools.target_cc
+                } else {
+                    &tools.host_cc
+                };
+
+                inputs.insert(SingleDerivedPath::Opaque(cc.store_path.clone()));
+                add_codegen(&mut args, "linker", &cc.real_path.display());
+            }
             // internal to rustc, but required
             if crate_type == "proc-macro" {
                 args.push_back("--extern".into());

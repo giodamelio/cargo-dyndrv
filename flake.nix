@@ -35,6 +35,32 @@
             ENV_WRAP = lib.getExe self.packages.${system}.env-wrap;
             TARGET_ENV = lib.getExe self.packages.${system}.target-env;
           };
+          cross =
+            let
+              pkgs' = pkgs.pkgsCross.aarch64-multiplatform;
+            in
+            pkgs'.stdenv.mkDerivation rec {
+              name = "shell-cross";
+              nativeBuildInputs = with pkgs'; [
+                rustc
+                cargo
+                rustfmt
+                clippy
+
+                gdb
+                rust-analyzer
+              ];
+
+              HOST_CC = lib.getExe pkgs'.buildPackages.stdenv.cc;
+              HOST_CXX = lib.getExe' pkgs'.buildPackages.stdenv.cc "${pkgs'.buildPackages.stdenv.cc.targetPrefix}c++";
+
+              "CARGO_TARGET_${pkgs'.stdenv.buildPlatform.rust.cargoEnvVarTarget}_LINKER" = HOST_CC;
+              "CARGO_TARGET_${pkgs'.hostPlatform.rust.cargoEnvVarTarget}_LINKER" = lib.getExe pkgs'.stdenv.cc;
+
+              BUILD_WRAP = lib.getExe self.packages.${system}.build-wrap;
+              ENV_WRAP = lib.getExe self.packages.${system}.env-wrap;
+              TARGET_ENV = lib.getExe self.packages.${system}.target-env;
+            };
         }
       );
 
