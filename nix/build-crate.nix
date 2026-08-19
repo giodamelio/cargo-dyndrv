@@ -22,7 +22,7 @@ let
   '';
 
   baseDerivation = rustPlatform.buildRustPackage (
-    args
+    (lib.removeAttrs args [ "extern" ])
     // {
       name = "cargo-dyndrv-build.drv";
 
