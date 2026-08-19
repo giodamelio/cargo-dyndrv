@@ -2,10 +2,9 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt::Display,
     hash::{Hash, Hasher},
-    path::{Path, PathBuf},
-    process::Stdio,
+    path::Path,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use cargo_metadata::MetadataCommand;
@@ -20,85 +19,24 @@ use harmonia_store_path::{FromStoreDirStr, StoreDir, StorePath, StorePathName};
 use harmonia_store_remote::HandshakeDaemonStore as _;
 use harmonia_utils_hash::Algorithm::SHA256;
 
-use crate::util::{CloneBytes as _, IntoBytes as _};
+use crate::{
+    unit_graph::{CompileMode, Unit, UnitGraph},
+    util::{CloneBytes as _, IntoBytes as _},
+};
 
 mod store;
 mod tools;
+mod unit_graph;
 mod util;
 
-const SCRIPT_FLAGS_OUTPUT: &str = "flags";
+static OUTPUT_OUT: LazyLock<OutputName> = LazyLock::new(|| OutputName::default());
+static OUTPUT_FLAGS: LazyLock<OutputName> =
+    LazyLock::new(|| OutputName::from_str("flags").unwrap());
+
 const SCRIPT_IMMEDIATE_ARGS: &str = "args-immediate";
 const SCRIPT_TRANSITIVE_ARGS: &str = "args-transitive";
 const SCRIPT_IMMEDIATE_ENV: &str = "env";
 const SCRIPT_METADATA_ENV: &str = "metadata";
-
-#[derive(PartialEq, Eq, Copy, Clone, Debug, Hash, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum CompileMode {
-    Test,
-    Build,
-    Check,
-    Doc,
-    Dooctest,
-    Docscrape,
-    RunCustomBuild,
-}
-
-#[derive(Debug, Hash, serde::Deserialize)]
-#[allow(unused)]
-struct Target {
-    pub kind: Vec<String>,
-    pub crate_types: Vec<String>,
-    pub name: String,
-    pub src_path: PathBuf,
-    pub edition: String,
-    pub doc: bool,
-    pub doctest: bool,
-    pub test: bool,
-}
-
-#[derive(Debug, Hash, serde::Deserialize)]
-#[allow(unused)]
-struct Profile {
-    pub name: String,
-    pub opt_level: String,
-    pub lto: String,
-    pub codegen_backend: Option<String>,
-    pub codgen_units: Option<u32>,
-    pub debuginfo: u32,
-    pub split_debuginfo: Option<String>,
-    pub debug_assertions: bool,
-    pub overflow_checks: bool,
-    pub rpath: bool,
-    pub incremental: bool,
-    pub panic: String,
-    // TODO: Strip
-}
-
-#[derive(Debug, Hash, serde::Deserialize)]
-struct Dependency {
-    pub index: usize,
-    pub extern_crate_name: String,
-}
-
-#[derive(Debug, Hash, serde::Deserialize)]
-#[allow(unused)]
-struct Unit {
-    pub pkg_id: String,
-    pub target: Target,
-    pub profile: Profile,
-    pub platform: Option<String>,
-    pub mode: CompileMode,
-    pub features: Vec<String>,
-    pub dependencies: Vec<Dependency>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct UnitGraph {
-    pub version: u32,
-    pub units: Vec<Unit>,
-    pub roots: Vec<usize>,
-}
 
 #[derive(Debug, Clone, Default)]
 struct UnitCacheMeta {
@@ -240,25 +178,7 @@ async fn main() -> eyre::Result<()> {
     // Shelling out to `cargo` since the cargo crate does not provide what we need
     let sys_args: Vec<_> = std::env::args().collect();
 
-    let unit_graph: UnitGraph = {
-        let output = std::process::Command::new(&tools.cargo.real_path)
-            .args(&sys_args[1..])
-            .arg("-Z")
-            .arg("unstable-options")
-            .arg("--unit-graph")
-            .stderr(Stdio::inherit())
-            .output()
-            .wrap_err("Executing cargo")?;
-
-        if !output.status.success() {
-            eyre::bail!(
-                "Cargo failed with error {}",
-                output.status.code().unwrap_or(-1)
-            )
-        }
-
-        serde_json::from_slice(&output.stdout)?
-    };
+    let unit_graph = UnitGraph::discover(&tools.cargo.real_path, &sys_args[1..])?;
 
     // The unit graph doesn't give us everything we want,
     // but the remainder can come from the packages in `cargo metadata`
@@ -373,12 +293,9 @@ async fn main() -> eyre::Result<()> {
                 } else if dep_cache.meta.has_links {
                     inputs.insert(SingleDerivedPath::Built {
                         drv_path: Arc::new(SingleDerivedPath::Opaque(dep_cache.drv_path.clone())),
-                        output: OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap(),
+                        output: OUTPUT_FLAGS.clone(),
                     });
-                    let flags = Placeholder::ca_output(
-                        &dep_cache.drv_path,
-                        &OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap(),
-                    );
+                    let flags = Placeholder::ca_output(&dep_cache.drv_path, &OUTPUT_FLAGS);
                     env_files.push(flags.render().join(SCRIPT_METADATA_ENV));
                 }
             }
@@ -404,20 +321,16 @@ async fn main() -> eyre::Result<()> {
                 .expect("units out of order");
             inputs.insert(SingleDerivedPath::Built {
                 drv_path: Arc::new(SingleDerivedPath::Opaque(executable_cache.drv_path.clone())),
-                output: OutputName::default(),
+                output: OUTPUT_OUT.clone(),
             });
             // flags_dir
-            args.push_back(
-                Placeholder::standard_output(&OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap())
-                    .into_bytes(),
-            );
+            args.push_back(Placeholder::standard_output(&OUTPUT_FLAGS).into_bytes());
             // out_dir
-            args.push_back(Placeholder::standard_output(&OutputName::default()).into_bytes());
+            args.push_back(Placeholder::standard_output(&OUTPUT_OUT).into_bytes());
             // script
             args.push_back({
                 let mut script =
-                    Placeholder::ca_output(&executable_cache.drv_path, &OutputName::default())
-                        .render();
+                    Placeholder::ca_output(&executable_cache.drv_path, &OUTPUT_OUT).render();
                 script.push(&executable_dep.extern_crate_name);
                 script.into_bytes()
             });
@@ -457,13 +370,13 @@ async fn main() -> eyre::Result<()> {
                         .wrap_err("invalid derivation name")?,
                     outputs: BTreeMap::from([
                         (
-                            OutputName::default(),
+                            OUTPUT_OUT.clone(),
                             DerivationOutput::CAFloating(
                                 ContentAddressMethodAlgorithm::NixArchive(SHA256),
                             ),
                         ),
                         (
-                            OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap(),
+                            OUTPUT_FLAGS.clone(),
                             DerivationOutput::CAFloating(
                                 ContentAddressMethodAlgorithm::NixArchive(SHA256),
                             ),
@@ -512,9 +425,7 @@ async fn main() -> eyre::Result<()> {
             add_long(
                 &mut args,
                 "out-dir",
-                &Placeholder::standard_output(&OutputName::default())
-                    .render()
-                    .display(),
+                &Placeholder::standard_output(&OUTPUT_OUT).render().display(),
             );
 
             add_long(&mut args, "crate-name", &unit.target.name.replace("-", "_"));
@@ -568,27 +479,22 @@ async fn main() -> eyre::Result<()> {
                 // Needed for either library deps or OUT_PATH
                 inputs.insert(SingleDerivedPath::Built {
                     drv_path: Arc::new(SingleDerivedPath::Opaque(dep.drv_path.clone())),
-                    output: OutputName::default(),
+                    output: OUTPUT_OUT.clone(),
                 });
 
                 if dep.meta.custom_output {
                     inputs.insert(SingleDerivedPath::Built {
                         drv_path: Arc::new(SingleDerivedPath::Opaque(dep.drv_path.clone())),
-                        output: OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap(),
+                        output: OUTPUT_FLAGS.clone(),
                     });
 
-                    let flags = Placeholder::ca_output(
-                        &dep.drv_path,
-                        &OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap(),
-                    )
-                    .render();
+                    let flags = Placeholder::ca_output(&dep.drv_path, &OUTPUT_FLAGS).render();
 
                     args.push_back(
                         format!("@{}", flags.join(SCRIPT_TRANSITIVE_ARGS).display()).into(),
                     );
                 } else {
-                    let placeholder =
-                        Placeholder::ca_output(&dep.drv_path, &OutputName::default()).render();
+                    let placeholder = Placeholder::ca_output(&dep.drv_path, &OUTPUT_OUT).render();
                     args.push_back("-L".into());
                     args.push_back(format!("dependency={}", placeholder.display()).into());
                 }
@@ -598,7 +504,7 @@ async fn main() -> eyre::Result<()> {
                 // no need to add inputs here, they're already handled from transitive deps
                 let dep = drv_cache[direct_dep.index].as_ref().unwrap();
 
-                let out = Placeholder::ca_output(&dep.drv_path, &OutputName::default()).render();
+                let out = Placeholder::ca_output(&dep.drv_path, &OUTPUT_OUT).render();
 
                 if let Some(dep_base_name) = dep.meta.base_name.as_ref() {
                     args.push_back("--extern".into());
@@ -616,11 +522,7 @@ async fn main() -> eyre::Result<()> {
                 if dep.meta.custom_output {
                     inputs.insert(SingleDerivedPath::Opaque(tools.env_wrap.store_path.clone()));
                     env.insert("OUT_DIR".into(), out.into_bytes());
-                    let flags = Placeholder::ca_output(
-                        &dep.drv_path,
-                        &OutputName::from_str(SCRIPT_FLAGS_OUTPUT).unwrap(),
-                    )
-                    .render();
+                    let flags = Placeholder::ca_output(&dep.drv_path, &OUTPUT_FLAGS).render();
 
                     // reversed since we're pushing from the front
                     args.push_front("--".into());
@@ -644,7 +546,7 @@ async fn main() -> eyre::Result<()> {
                 Derivation {
                     name: StorePathName::from_str(drv_name).wrap_err("invalid derivation name")?,
                     outputs: BTreeMap::from([(
-                        OutputName::default(),
+                        OUTPUT_OUT.clone(),
                         DerivationOutput::CAFloating(ContentAddressMethodAlgorithm::NixArchive(
                             SHA256,
                         )),
