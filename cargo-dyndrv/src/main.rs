@@ -29,7 +29,7 @@ mod tools;
 mod unit_graph;
 mod util;
 
-static OUTPUT_OUT: LazyLock<OutputName> = LazyLock::new(|| OutputName::default());
+static OUTPUT_OUT: LazyLock<OutputName> = LazyLock::new(OutputName::default);
 static OUTPUT_FLAGS: LazyLock<OutputName> =
     LazyLock::new(|| OutputName::from_str("flags").unwrap());
 
@@ -248,14 +248,6 @@ async fn main() -> eyre::Result<()> {
 
         let mut env = base_env.clone();
         // TODO: more cargo env vars not from cargo metadata
-        // TODO: calculate target info, most can be done with `rustc --print=cfg`
-        // Might require a wrapper, since cfg items set from build scripts will affect this
-        // host can come from `rustc --print=host-tuple`
-        env.insert("HOST".into(), "x86_64-unknown-linux-gnu".into());
-        env.insert("TARGET".into(), "x86_64-unknown-linux-gnu".into());
-        env.insert("CARGO_CFG_TARGET_OS".into(), "linux".into());
-        env.insert("CARGO_CFG_TARGET_ARCH".into(), "x86_64".into());
-        env.insert("CARGO_CFG_TARGET_POINTER_WIDTH".into(), "64".into());
         add_metadata_env(&mut env, unit_meta);
 
         env.insert(
@@ -270,6 +262,16 @@ async fn main() -> eyre::Result<()> {
         ]);
 
         let (drv, meta) = if unit.mode == CompileMode::RunCustomBuild {
+            // TODO cfg flags set by dependencies, perhaps it could go through the same
+            // path as metadata
+            // Might require a wrapper, since cfg items set from build scripts will affect this
+            // host can come from `rustc --print=host-tuple`
+            env.insert("HOST".into(), "x86_64-unknown-linux-gnu".into());
+            env.insert("TARGET".into(), "x86_64-unknown-linux-gnu".into());
+            env.insert("CARGO_CFG_TARGET_OS".into(), "linux".into());
+            env.insert("CARGO_CFG_TARGET_ARCH".into(), "x86_64".into());
+            env.insert("CARGO_CFG_TARGET_POINTER_WIDTH".into(), "64".into());
+
             inputs.insert(SingleDerivedPath::Opaque(
                 tools.build_wrap.store_path.clone(),
             ));

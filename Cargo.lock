@@ -1168,6 +1168,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "target-env"
+version = "0.1.0"
+
+[[package]]
 name = "thiserror"
 version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"

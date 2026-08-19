@@ -33,25 +33,28 @@
             # or cargo (but not rustc) from fenix
             BUILD_WRAP = lib.getExe self.packages.${system}.build-wrap;
             ENV_WRAP = lib.getExe self.packages.${system}.env-wrap;
+            TARGET_ENV = lib.getExe self.packages.${system}.target-env;
           };
         }
       );
 
       packages = forAllSystems (
-        system: pkgs: rec {
-          # these two only use stdlib, no need to use cargo
-          build-wrap = pkgs.buildRustCrate {
-            crateName = "build-wrap";
-            version = "0.1.0";
-            src = ./build-wrap;
-            crateBin = [ { name = "build-wrap"; } ];
-          };
-          env-wrap = pkgs.buildRustCrate {
-            crateName = "env-wrap";
-            version = "0.1.0";
-            src = ./env-wrap;
-            crateBin = [ { name = "env-wrap"; } ];
-          };
+        system: pkgs:
+        let
+          # these only use stdlib, no need to use cargo
+          makeHelper =
+            name:
+            pkgs.buildRustCrate {
+              crateName = name;
+              version = "0.1.0";
+              src = ./${name};
+              crateBin = [ { inherit name; } ];
+            };
+        in
+        rec {
+          build-wrap = makeHelper "build-wrap";
+          env-wrap = makeHelper "env-wrap";
+          target-env = makeHelper "target-env";
 
           cargo-dyndrv = pkgs.rustPlatform.buildRustPackage rec {
             pname = "cargo-dyndrv";
@@ -71,6 +74,7 @@
             env = {
               BUILD_WRAP = lib.getExe build-wrap;
               ENV_WRAP = lib.getExe env-wrap;
+              TARGET_ENV = lib.getExe target-env;
               LN = lib.getExe' pkgs.coreutils "ln";
             };
 
