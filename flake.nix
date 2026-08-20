@@ -89,7 +89,19 @@
             pname = "cargo-dyndrv";
             version = "0.1.0";
 
-            src = ./.;
+            src = lib.fileset.toSource {
+              root = ./.;
+              fileset = lib.fileset.unions [
+                ./Cargo.toml
+                ./Cargo.lock
+                ./cargo-dyndrv
+                # cargo insists on seeing all members of a workspace,
+                # even when resolving only one of them.
+                ./env-wrap
+                ./target-env
+                ./build-wrap
+              ];
+            };
             cargoLock = {
               lockFile = ./Cargo.lock;
               outputHashes."harmonia-file-core-3.1.0" = "sha256-hPdQB+DWc/q6w/wnTVGCS8iugEGd60Ym3x2eWvVw3ss=";
