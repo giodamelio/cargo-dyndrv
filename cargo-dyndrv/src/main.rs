@@ -484,13 +484,16 @@ async fn main() -> eyre::Result<()> {
 
                 hasher.finish()
             };
+            // Notice that there is metadata but no extra-filename.
+            // Since every crate goes in its own derivation with its own output directory,
+            // there is no chance filenames will ever conflict.
+            // Symbol names, on the other hand, are linked into the same binary,
+            // so metadata is required to prevent linking conflicts.
             add_codegen(&mut args, "metadata", &format_args!("{:016x}", dep_hash));
             let base_name = if crate_type == "lib" || crate_type == "proc-macro" {
-                let extra = format!("-{:016x}", dep_hash);
-                add_codegen(&mut args, "extra-filename", &extra);
                 // cargo uses rustc outputs to learn rmeta locations.
                 // we don't have that luxury, but the default path is documented.
-                Some(format!("lib{}{}", unit.target.name, extra))
+                Some(format!("lib{}", unit.target.name))
             } else {
                 None
             };
