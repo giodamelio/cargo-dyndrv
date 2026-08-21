@@ -69,15 +69,13 @@
           # these only use stdlib, no need to use cargo
           makeHelper =
             name:
-            final.buildRustCrate {
+            final.buildPackages.buildRustCrate {
               crateName = name;
               version = "0.1.0";
               src = ./${name};
               crateBin = [ { inherit name; } ];
             };
-        in
-        {
-          cargo-dyndrv = final.rustPlatform.buildRustPackage rec {
+          baseArgs = rec {
             pname = "cargo-dyndrv";
             version = "0.1.0";
 
@@ -109,11 +107,20 @@
               ENV_WRAP = lib.getExe (makeHelper "env-wrap");
               TARGET_ENV = lib.getExe (makeHelper "target-env");
 
-              LN = lib.getExe' final.coreutils "ln";
+              LN = lib.getExe' final.buildPackages.coreutils "ln";
             };
 
             meta.mainProgram = "cargo-dyndrv";
           };
+        in
+        {
+          cargo-dyndrv = final.rustPlatform.buildRustPackage baseArgs;
+          cargo-dyndrv-dyn = final.buildCrate (
+            baseArgs
+            // {
+              outputs = [ "cargo-dyndrv" ];
+            }
+          );
 
           writeExtern = final.callPackage ./nix/write-extern.nix { };
           buildCrate = final.callPackage ./nix/build-crate.nix { };
@@ -122,9 +129,12 @@
       packages = forAllSystems (pkgs: {
         inherit (pkgs)
           cargo-dyndrv
+          cargo-dyndrv-dyn
           writeExtern
           buildCrate
           ;
+
+        cargo-dyndrv-dyn-cross = pkgs.pkgsCross.aarch64-multiplatform.cargo-dyndrv-dyn;
       });
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt-tree);
