@@ -19,16 +19,16 @@
 let
   dyndrvAsCargo = runCommand "cargo-dyndrv-cargo" { } ''
     mkdir -p $out/bin
-    ln -s ${lib.getExe cargo-dyndrv} $out/bin/cargo
+    ln -s ${lib.getExe buildPackages.cargo-dyndrv} $out/bin/cargo
   '';
 
   baseDerivation = rustPlatform.buildRustPackage (
     (lib.removeAttrs args [ "extern" ])
     // {
-      name = "cargo-dyndrv-build.drv";
+      name = "cargo-dyndrv-build";
 
       env = (args.env or { }) // {
-        CARGO = lib.getExe cargo;
+        CARGO = lib.getExe buildPackages.cargo;
         EXTERN_PATH = writeExtern extern;
         HOST_CC = lib.getExe buildPackages.stdenv.cc;
       };

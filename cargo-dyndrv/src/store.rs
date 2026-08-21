@@ -119,7 +119,7 @@ pub async fn submit_wrapper<T: DaemonStore>(
         name: StorePathName::from_str(&drv_name)?,
         outputs: BTreeMap::from([(
             OUTPUT_OUT.clone(),
-            DerivationOutput::CAFloating(ContentAddressMethodAlgorithm::Flat(SHA256)),
+            DerivationOutput::CAFloating(ContentAddressMethodAlgorithm::NixArchive(SHA256)),
         )]),
         inputs: BTreeSet::from([
             SingleDerivedPath::Built {
