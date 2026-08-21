@@ -2,6 +2,7 @@
   lib,
   stdenv,
   runCommand,
+  buildPackages,
   rustPlatform,
   cargo,
   writeExtern,
@@ -29,6 +30,7 @@ let
       env = (args.env or { }) // {
         CARGO = lib.getExe cargo;
         EXTERN_PATH = writeExtern extern;
+        HOST_CC = lib.getExe buildPackages.stdenv.cc;
       };
       nativeBuildInputs = (args.nativeBuildInputs or [ ]) ++ [
         dyndrvAsCargo
