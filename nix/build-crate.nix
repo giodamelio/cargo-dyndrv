@@ -36,9 +36,8 @@ let
         dyndrvAsCargo
       ];
 
-      # It's only possible to send one output,
-      # but the generated derivation may have multiple
-      outputs = [ "out" ];
+      # Each output is a derivation
+      outputs = lib.map (name: "${name}.drv") outputs;
 
       doCheck = false;
       dontInstall = false;
@@ -72,6 +71,8 @@ runCommand name
   }
   (
     lib.concatMapStringsSep "\n" (output: ''
-      ln -sL ${builtins.outputOf baseDerivation.outPath output} ${builtins.placeholder output}
+      ln -sL ${
+        builtins.outputOf baseDerivation.${"${output}.drv"}.outPath "out"
+      } ${builtins.placeholder output}
     '') outputs
   )

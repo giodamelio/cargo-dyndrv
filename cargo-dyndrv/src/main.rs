@@ -617,16 +617,15 @@ async fn main() -> eyre::Result<()> {
         drv_cache[unit_idx] = Some(UnitCache { drv_path, meta });
     }
 
-    let mut drvs = BTreeMap::new();
     for unit_idx in unit_graph.roots {
         let drv_path = &drv_cache[unit_idx].as_ref().unwrap().drv_path;
         println!("{}", store_dir.display(drv_path));
-        drvs.insert(unit_graph.units[unit_idx].target.name.as_str(), drv_path);
-    }
 
-    // TODO: need more handling if there is both a lib and a bin of the same crate
-    if store::is_in_derivation() {
-        store::submit_wrappers(&mut store, &store_dir, &tools.ln, &drvs).await?;
+        if store::is_in_derivation() {
+            // TODO: need more handling if there is both a lib and a bin of the same crate
+            let name = unit_graph.units[unit_idx].target.name.as_str();
+            store::submit_wrapper(&mut store, &store_dir, &tools.ln, name, drv_path).await?;
+        }
     }
 
     // TODO: run the build if we are outside a derivation,

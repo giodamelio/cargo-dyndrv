@@ -98,69 +98,59 @@ pub async fn add_drv_to_store<T: DaemonStore>(
         .path)
 }
 
-pub async fn submit_wrappers<T: DaemonStore>(
+pub async fn submit_wrapper<T: DaemonStore>(
     store: &mut T,
     store_dir: &StoreDir,
     ln: &Tool,
-    outputs: &BTreeMap<&str, &StorePath>,
+    unit_name: &str,
+    base_drv: &StorePath,
 ) -> eyre::Result<()> {
     // We're only allowed to submit if the name is correct.
     // The easiest way to do this without breaking the inner loop is a symlink
+    // If we're running in nixpkgs, we'll get a $name environment variable with the
+    // derivation name. outputs should be named "$name-$output_name.drv"
+    let base_name = std::env::var("name")
+        .wrap_err("could not read derivation name, is this in nixpkgs stdenv?")?;
+
+    let output_name = format!("{}.drv", unit_name);
+    let drv_name = format!("{}-{}", base_name, unit_name);
+
     let wrapper_drv = Derivation {
-        name: StorePathName::from_str("cargo-dyndrv-build.drv")?,
-        outputs: outputs
-            .keys()
-            .map(|name| {
-                Ok((
-                    OutputName::from_str(name).wrap_err("crate name is not valid output")?,
-                    DerivationOutput::CAFloating(ContentAddressMethodAlgorithm::NixArchive(SHA256)),
-                ))
-            })
-            .collect::<eyre::Result<_>>()?,
-        inputs: outputs
-            .values()
-            .map(|drv_path| SingleDerivedPath::Built {
-                drv_path: Arc::new(SingleDerivedPath::Opaque((*drv_path).clone())),
+        name: StorePathName::from_str(&drv_name)?,
+        outputs: BTreeMap::from([(
+            OUTPUT_OUT.clone(),
+            DerivationOutput::CAFloating(ContentAddressMethodAlgorithm::Flat(SHA256)),
+        )]),
+        inputs: BTreeSet::from([
+            SingleDerivedPath::Built {
+                drv_path: Arc::new(SingleDerivedPath::Opaque(base_drv.clone())),
                 output: OUTPUT_OUT.clone(),
-            })
-            .chain([SingleDerivedPath::Opaque(ln.store_path.clone())])
-            .collect(),
-        platform: PLATFORM.clone(),
-        builder: "/bin/sh".into(),
-        args: Vec::from([
-            "-c".into(),
-            outputs
-                .iter()
-                .map(|(name, drv_path)| {
-                    let dest =
-                        Placeholder::standard_output(&OutputName::from_str(name).unwrap()).render();
-                    let src = Placeholder::ca_output(drv_path, &OUTPUT_OUT).render();
-
-                    let mut buf = bytes::BytesMut::new();
-                    buf.extend(ln.real_path.clone_bytes());
-                    buf.extend_from_slice(" -s ".as_bytes());
-                    buf.extend(src.into_bytes());
-                    buf.extend(" ".as_bytes());
-                    buf.extend(dest.into_bytes());
-                    buf.extend(";".as_bytes());
-
-                    buf.into()
-                })
-                .fold(bytes::BytesMut::new(), |mut acc, rhs: bytes::Bytes| {
-                    acc.extend(rhs);
-                    acc
-                })
-                .into(),
+            },
+            SingleDerivedPath::Opaque(ln.store_path.clone()),
         ]),
+        platform: PLATFORM.clone(),
+        builder: ln.real_path.clone_bytes(),
+        args: Vec::from([
+            "-s".into(),
+            Placeholder::ca_output(base_drv, &OUTPUT_OUT)
+                .render()
+                .into_bytes(),
+            Placeholder::standard_output(&OUTPUT_OUT)
+                .render()
+                .into_bytes(),
+        ]),
+
         env: BTreeMap::new(),
         structured_attrs: None,
     };
 
-    let wrapper_drv_path =
-        add_drv_to_store(store, store_dir, wrapper_drv, "cargo-dyndrv-build").await?;
+    let wrapper_drv_path = add_drv_to_store(store, store_dir, wrapper_drv, &drv_name).await?;
 
     store
-        .submit_output(&SingleDerivedPath::Opaque(wrapper_drv_path), &OUTPUT_OUT)
+        .submit_output(
+            &SingleDerivedPath::Opaque(wrapper_drv_path),
+            &OutputName::from_str(&output_name)?,
+        )
         .await?;
 
     Ok(())
