@@ -366,8 +366,8 @@ async fn main() -> eyre::Result<()> {
 
             if let Some(extern_config) = all_extern_config.get(&unit.pkg_id) {
                 eprintln!("Handling external config for {}", unit.pkg_id);
-                for extra_dep in &extern_config.inputs {
-                    let store_path = StorePath::from_store_dir_str(&store_dir, extra_dep)
+                for extra_input in &extern_config.inputs {
+                    let store_path = StorePath::from_store_dir_str(&store_dir, extra_input)
                         .wrap_err("Invalid store path in extra")?;
                     inputs.insert(SingleDerivedPath::Opaque(store_path));
                 }

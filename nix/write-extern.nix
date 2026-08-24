@@ -18,7 +18,7 @@ let
         nativeBuildInputs = [ jq ];
       }
       ''
-        jq -s '{"${name}": {extra_deps: .[0].graph[] | select(.path == "${baseJSON}") | .references} * .[1]}' "$NIX_ATTRS_JSON_FILE" "${baseJSON}" > $out
+        jq -s '{"${name}": {inputs: .[0].graph[] | select(.path == "${baseJSON}") | .references} * .[1]}' "$NIX_ATTRS_JSON_FILE" "${baseJSON}" > $out
       '';
 in
 extern:
