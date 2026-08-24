@@ -50,11 +50,11 @@ struct UnitCache {
 #[derive(Debug, serde::Deserialize)]
 struct ExternConfig {
     #[serde(default)]
-    pub extra_deps: Vec<String>,
+    pub inputs: Vec<String>,
     #[serde(default)]
-    pub extra_env: BTreeMap<String, String>,
+    pub env: BTreeMap<String, String>,
     #[serde(default)]
-    pub extra_path: Vec<String>,
+    pub path: Vec<String>,
 }
 
 fn order_units(
@@ -366,17 +366,17 @@ async fn main() -> eyre::Result<()> {
 
             if let Some(extern_config) = all_extern_config.get(&unit.pkg_id) {
                 eprintln!("Handling external config for {}", unit.pkg_id);
-                for extra_dep in &extern_config.extra_deps {
+                for extra_dep in &extern_config.inputs {
                     let store_path = StorePath::from_store_dir_str(&store_dir, extra_dep)
                         .wrap_err("Invalid store path in extra")?;
                     inputs.insert(SingleDerivedPath::Opaque(store_path));
                 }
 
-                for (var, value) in &extern_config.extra_env {
+                for (var, value) in &extern_config.env {
                     env.insert(var.clone().into(), value.clone().into());
                 }
 
-                for item in &extern_config.extra_path {
+                for item in &extern_config.path {
                     path.extend_from_slice(b":");
                     path.extend_from_slice(item.as_bytes());
                 }
