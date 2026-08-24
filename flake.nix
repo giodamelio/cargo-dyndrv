@@ -115,7 +115,7 @@
         in
         {
           cargo-dyndrv = final.rustPlatform.buildRustPackage baseArgs;
-          cargo-dyndrv-dyn = final.buildCrate (
+          cargo-dyndrv-dyn = final.buildDynamicCrate (
             baseArgs
             // {
               outputs = [ "cargo-dyndrv" ];
@@ -123,7 +123,7 @@
           );
 
           writeExtern = final.callPackage ./nix/write-extern.nix { };
-          buildCrate = final.callPackage ./nix/build-crate.nix { };
+          buildDynamicCrate = final.callPackage ./nix/build-crate.nix { };
         };
 
       packages = forAllSystems (pkgs: {
@@ -131,7 +131,7 @@
           cargo-dyndrv
           cargo-dyndrv-dyn
           writeExtern
-          buildCrate
+          buildDynamicCrate
           ;
 
         cargo-dyndrv-dyn-cross = pkgs.pkgsCross.aarch64-multiplatform.cargo-dyndrv-dyn;
