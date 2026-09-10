@@ -32,7 +32,7 @@ pub static OUTPUT_FLAGS: LazyLock<OutputName> =
 
 pub fn is_in_derivation() -> bool {
     static VALUE: OnceLock<bool> = OnceLock::new();
-    *VALUE.get_or_init(|| std::env::var_os("NIX_BUILD_TOP").is_some())
+    *VALUE.get_or_init(|| std::env::var_os("CARGO_DYNDRV_IN_DRV").is_some())
 }
 
 pub fn daemon_path() -> PathBuf {

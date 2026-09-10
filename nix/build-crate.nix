@@ -31,6 +31,8 @@ let
         CARGO = lib.getExe buildPackages.cargo;
         EXTERN_PATH = writeExtern extern;
         HOST_CC = lib.getExe buildPackages.stdenv.cc;
+        # NIX_BUILD_TOP seems like it would be convenient, but it is also set in dev shells
+        CARGO_DYNDRV_IN_DRV = "";
       };
       nativeBuildInputs = (args.nativeBuildInputs or [ ]) ++ [
         dyndrvAsCargo
