@@ -1,2 +1,0 @@
-can use multiple @file in rustc to read newline-separated arguments
-link args for all transitive dependants, other args for immediate only
