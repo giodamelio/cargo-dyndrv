@@ -6,8 +6,6 @@ for each crate, adding only the necessary dependencies.
 All generated derivations are content-addressing, which can can reduce rebuilds when a crate's source code or build
 flags change but the resulting binary is identical.
 
-- [cargo-dyndrv: A Beginning](https://blog.obsidian.systems/cargo-dyndrv-a-beginning/) (2026-09-16)
-
 ## Inside a derivation
 A simple example is included in the [ffmpeg-example](https://github.com/obsidiansystems/cargo-dyndrv/tree/ffmpeg-example)
 branch.
@@ -71,7 +69,9 @@ macOS is unlikely to work properly due to hardcoded name assumptions in the code
 
 ## Blog posts
 
-As we work on `cargo-dyndrv`, we aim to write up what we are doing in a series of blog posts.
+As we work on `cargo-dyndrv`, we aim to write up what we are doing in a series of blog posts:
+
+1. [cargo-dyndrv: A Beginning](https://blog.obsidian.systems/cargo-dyndrv-a-beginning/) (2026-09-16)
 
 ---
 
