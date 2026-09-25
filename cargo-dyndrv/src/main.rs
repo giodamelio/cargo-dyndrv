@@ -462,6 +462,19 @@ async fn main() -> eyre::Result<()> {
             } else if unit.mode == CompileMode::Build {
                 if crate_type == "lib" || crate_type == "rlib" {
                     add_long(&mut args, "emit", &"metadata,link");
+                } else if crate_type == "bin"
+                    && !unit.target.kind.iter().any(|kind| kind == "custom-build")
+                {
+                    // match cargo's naming of binaries. rustc names them after the target,
+                    // which has it's dashes mangled, where cargo keeps the original bin name
+                    let binary = Placeholder::standard_output(&OUTPUT_OUT)
+                        .render()
+                        .join(&unit.target.name);
+                    add_long(
+                        &mut args,
+                        "emit",
+                        &format_args!("link={}", binary.display()),
+                    );
                 } else {
                     add_long(&mut args, "emit", &"link");
                 }
