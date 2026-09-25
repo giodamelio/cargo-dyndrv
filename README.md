@@ -30,6 +30,16 @@ An entry for a crate that uses pkg-config might look like:
 };
 ```
 
+Each crate's derivation receives only its own package directory as source.
+If a crate reads files outside it, such as a macro that opens `../../openapi.json`,
+list those paths under `include`, relative to the package directory.
+The source then becomes the smallest tree that contains the package and every included path:
+```nix
+"path+file:///build/source/crates/cli#cthulhu-cli@0.1.0" = {
+  include = [ "../../openapi.json" ];
+};
+```
+
 ## Outside a derivation
 It is possible to run cargo-dyndrv outside of a derivation for testing or development.
 

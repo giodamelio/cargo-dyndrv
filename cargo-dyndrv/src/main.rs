@@ -55,6 +55,8 @@ struct ExternConfig {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub path: Vec<String>,
+    #[serde(default)]
+    pub include: Vec<String>,
 }
 
 fn order_units(
@@ -236,9 +238,15 @@ async fn main() -> eyre::Result<()> {
 
         let drv_name = crate_root.file_name().ok_or_eyre("empty path")?;
 
-        let src_path = store::add_to_store_nar(
+        let include = all_extern_config
+            .get(&unit.pkg_id)
+            .map(|extern_config| extern_config.include.as_slice())
+            .unwrap_or_default();
+        let (src_path, manifest_dir) = store::add_package_source(
             &mut store,
-            crate_root.to_path_buf().into(),
+            &store_dir,
+            crate_root.as_std_path(),
+            include,
             &format!("{}-src", drv_name),
         )
         .await?;
@@ -249,10 +257,7 @@ async fn main() -> eyre::Result<()> {
         // TODO: more cargo env vars not from cargo metadata
         add_metadata_env(&mut env, unit_meta);
 
-        env.insert(
-            "CARGO_MANIFEST_DIR".into(),
-            src_path.to_absolute_path(&store_dir).into_bytes(),
-        );
+        env.insert("CARGO_MANIFEST_DIR".into(), manifest_dir.clone_bytes());
 
         let mut inputs = BTreeSet::from([
             SingleDerivedPath::Opaque(tools.rustc.store_path.clone()),
@@ -349,7 +354,7 @@ async fn main() -> eyre::Result<()> {
             // build-wrap executable (running inside env-wrap)
             args.push(tools.build_wrap.real_path.clone_bytes());
             // cwd (directory for build.rs exeuction)
-            args.push(src_path.to_absolute_path(&store_dir).into_bytes());
+            args.push(manifest_dir.clone_bytes());
             // links_key
             args.push(unit_meta.links.clone().unwrap_or_default().into());
             // flags_dir
@@ -442,8 +447,7 @@ async fn main() -> eyre::Result<()> {
                     .src_path
                     .strip_prefix(crate_root)
                     .wrap_err("internal: crate main is not in crate root???")?;
-                let mut path = src_path.to_absolute_path(&store_dir);
-                path.push(crate_relative);
+                let path = manifest_dir.join(crate_relative);
                 args.push_back(path.into_bytes())
             }
 
@@ -487,13 +491,22 @@ async fn main() -> eyre::Result<()> {
             // TODO: embed-bitcode, lto
             // TODO: check-cfg
             // TODO: improve hash calculation
+            // Unit indices are left out: cargo does not number units that differ only in
+            // profile in a stable order, and a dependency's derivation path already
+            // identifies it.
             let dep_hash = {
                 let mut hasher = std::hash::DefaultHasher::new();
                 for direct_dep in &unit.dependencies {
                     let dep = drv_cache[direct_dep.index].as_ref().unwrap();
                     Hash::hash(&dep.drv_path, &mut hasher);
+                    direct_dep.extern_crate_name.hash(&mut hasher);
                 }
-                unit.hash(&mut hasher);
+                unit.pkg_id.hash(&mut hasher);
+                unit.target.hash(&mut hasher);
+                unit.profile.hash(&mut hasher);
+                unit.platform.hash(&mut hasher);
+                unit.mode.hash(&mut hasher);
+                unit.features.hash(&mut hasher);
 
                 hasher.finish()
             };
@@ -515,8 +528,12 @@ async fn main() -> eyre::Result<()> {
                 add_feature(&mut args, feature);
             }
 
-            for transitive_dep in &transitive_deps[&unit_idx] {
-                let dep = drv_cache[*transitive_dep].as_ref().unwrap();
+            let mut ordered_transitive_deps: Vec<_> = transitive_deps[&unit_idx]
+                .iter()
+                .map(|transitive_dep| drv_cache[*transitive_dep].as_ref().unwrap())
+                .collect();
+            ordered_transitive_deps.sort_by(|a, b| a.drv_path.cmp(&b.drv_path));
+            for dep in ordered_transitive_deps {
                 // Needed for either library deps or OUT_PATH
                 inputs.insert(SingleDerivedPath::Built {
                     drv_path: Arc::new(SingleDerivedPath::Opaque(dep.drv_path.clone())),
