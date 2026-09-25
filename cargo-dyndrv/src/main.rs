@@ -474,13 +474,22 @@ async fn main() -> eyre::Result<()> {
             // TODO: embed-bitcode, lto
             // TODO: check-cfg
             // TODO: improve hash calculation
+            // Unit indices are left out: cargo does not number units that differ only in
+            // profile in a stable order, and a dependency's derivation path already
+            // identifies it.
             let dep_hash = {
                 let mut hasher = std::hash::DefaultHasher::new();
                 for direct_dep in &unit.dependencies {
                     let dep = drv_cache[direct_dep.index].as_ref().unwrap();
                     Hash::hash(&dep.drv_path, &mut hasher);
+                    direct_dep.extern_crate_name.hash(&mut hasher);
                 }
-                unit.hash(&mut hasher);
+                unit.pkg_id.hash(&mut hasher);
+                unit.target.hash(&mut hasher);
+                unit.profile.hash(&mut hasher);
+                unit.platform.hash(&mut hasher);
+                unit.mode.hash(&mut hasher);
+                unit.features.hash(&mut hasher);
 
                 hasher.finish()
             };
@@ -502,8 +511,12 @@ async fn main() -> eyre::Result<()> {
                 add_feature(&mut args, feature);
             }
 
-            for transitive_dep in &transitive_deps[&unit_idx] {
-                let dep = drv_cache[*transitive_dep].as_ref().unwrap();
+            let mut ordered_transitive_deps: Vec<_> = transitive_deps[&unit_idx]
+                .iter()
+                .map(|transitive_dep| drv_cache[*transitive_dep].as_ref().unwrap())
+                .collect();
+            ordered_transitive_deps.sort_by(|a, b| a.drv_path.cmp(&b.drv_path));
+            for dep in ordered_transitive_deps {
                 // Needed for either library deps or OUT_PATH
                 inputs.insert(SingleDerivedPath::Built {
                     drv_path: Arc::new(SingleDerivedPath::Opaque(dep.drv_path.clone())),

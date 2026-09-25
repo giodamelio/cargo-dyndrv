@@ -48,13 +48,13 @@ pub struct Profile {
     // TODO: Strip
 }
 
-#[derive(Debug, Hash, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 pub struct Dependency {
     pub index: usize,
     pub extern_crate_name: String,
 }
 
-#[derive(Debug, Hash, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[allow(unused)]
 pub struct Unit {
     pub pkg_id: String,
