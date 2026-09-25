@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    path::PathBuf,
+    path::{Component, Path, PathBuf},
     str::FromStr,
     sync::{Arc, LazyLock, OnceLock},
 };
@@ -76,6 +76,100 @@ pub async fn add_to_store_nar<T: DaemonStore>(
         cache.insert(real_path, store_path.clone());
         Ok(store_path)
     }
+}
+
+/// Adds a package's source to the store, along with any `include` paths from its extern
+/// configuration. Those are relative to the package root and may reach outside it
+/// (`../../openapi.json`), so the source is staged as the smallest tree containing all of
+/// them. Returns the store path and the package root's location inside it.
+pub async fn add_package_source<T: DaemonStore>(
+    store: &mut T,
+    store_dir: &StoreDir,
+    crate_root: &Path,
+    include: &[String],
+    name: &str,
+) -> eyre::Result<(StorePath, PathBuf)> {
+    if include.is_empty() {
+        let src_path = add_to_store_nar(store, crate_root.to_path_buf(), name).await?;
+        let manifest_dir = src_path.to_absolute_path(store_dir);
+        return Ok((src_path, manifest_dir));
+    }
+
+    let mut depth = 0;
+    for item in include {
+        let mut components = Path::new(item).components().peekable();
+        let mut item_depth = 0;
+        while components.next_if_eq(&Component::ParentDir).is_some() {
+            item_depth += 1;
+        }
+        if !components.all(|component| matches!(component, Component::Normal(_))) {
+            eyre::bail!(
+                "include path {item:?} for {} must be relative, with `..` only at the start",
+                crate_root.display()
+            );
+        }
+        depth = depth.max(item_depth);
+    }
+
+    let base = crate_root.ancestors().nth(depth).ok_or_else(|| {
+        eyre::eyre!(
+            "include paths climb above the filesystem root from {}",
+            crate_root.display()
+        )
+    })?;
+    let package_relative = crate_root.strip_prefix(base)?;
+
+    let staging =
+        std::env::temp_dir().join(format!("cargo-dyndrv-{}-{}", std::process::id(), name));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+    copy_tree(crate_root, &staging.join(package_relative))?;
+    for item in include {
+        let source = crate_root.join(item);
+        let base_relative =
+            package_relative
+                .join(item)
+                .components()
+                .fold(PathBuf::new(), |mut path, component| {
+                    match component {
+                        Component::ParentDir => {
+                            path.pop();
+                        }
+                        other => path.push(other),
+                    }
+                    path
+                });
+        let destination = staging.join(base_relative);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        copy_tree(&source, &destination)
+            .wrap_err_with(|| format!("could not include {}", source.display()))?;
+    }
+
+    let src_path = add_to_store_nar(store, staging.clone(), name).await?;
+    std::fs::remove_dir_all(&staging)?;
+    let manifest_dir = src_path.to_absolute_path(store_dir).join(package_relative);
+    Ok((src_path, manifest_dir))
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> eyre::Result<()> {
+    let file_type = std::fs::symlink_metadata(source)
+        .wrap_err_with(|| format!("could not read {}", source.display()))?
+        .file_type();
+    if file_type.is_symlink() {
+        std::os::unix::fs::symlink(std::fs::read_link(source)?, destination)?;
+    } else if file_type.is_dir() {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+    } else {
+        std::fs::copy(source, destination)?;
+    }
+    Ok(())
 }
 
 pub async fn add_drv_to_store<T: DaemonStore>(

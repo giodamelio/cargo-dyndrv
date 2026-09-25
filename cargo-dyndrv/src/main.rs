@@ -55,6 +55,8 @@ struct ExternConfig {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub path: Vec<String>,
+    #[serde(default)]
+    pub include: Vec<String>,
 }
 
 fn order_units(
@@ -236,9 +238,15 @@ async fn main() -> eyre::Result<()> {
 
         let drv_name = crate_root.file_name().ok_or_eyre("empty path")?;
 
-        let src_path = store::add_to_store_nar(
+        let include = all_extern_config
+            .get(&unit.pkg_id)
+            .map(|extern_config| extern_config.include.as_slice())
+            .unwrap_or_default();
+        let (src_path, manifest_dir) = store::add_package_source(
             &mut store,
-            crate_root.to_path_buf().into(),
+            &store_dir,
+            crate_root.as_std_path(),
+            include,
             &format!("{}-src", drv_name),
         )
         .await?;
@@ -249,10 +257,7 @@ async fn main() -> eyre::Result<()> {
         // TODO: more cargo env vars not from cargo metadata
         add_metadata_env(&mut env, unit_meta);
 
-        env.insert(
-            "CARGO_MANIFEST_DIR".into(),
-            src_path.to_absolute_path(&store_dir).into_bytes(),
-        );
+        env.insert("CARGO_MANIFEST_DIR".into(), manifest_dir.clone_bytes());
 
         let mut inputs = BTreeSet::from([
             SingleDerivedPath::Opaque(tools.rustc.store_path.clone()),
@@ -349,7 +354,7 @@ async fn main() -> eyre::Result<()> {
             // build-wrap executable (running inside env-wrap)
             args.push(tools.build_wrap.real_path.clone_bytes());
             // cwd (directory for build.rs exeuction)
-            args.push(src_path.to_absolute_path(&store_dir).into_bytes());
+            args.push(manifest_dir.clone_bytes());
             // links_key
             args.push(unit_meta.links.clone().unwrap_or_default().into());
             // flags_dir
@@ -442,8 +447,7 @@ async fn main() -> eyre::Result<()> {
                     .src_path
                     .strip_prefix(crate_root)
                     .wrap_err("internal: crate main is not in crate root???")?;
-                let mut path = src_path.to_absolute_path(&store_dir);
-                path.push(crate_relative);
+                let path = manifest_dir.join(crate_relative);
                 args.push_back(path.into_bytes())
             }
 
